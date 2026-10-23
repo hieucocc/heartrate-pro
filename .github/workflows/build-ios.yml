@@ -8,18 +8,31 @@ on:
 jobs:
   build:
     runs-on: macos-14
+    strategy:
+      matrix:
+        # Release: standalone app with bundled JS.
+        # Debug: expo-dev-client, loads JS from your PC (no rebuild for JS edits).
+        configuration: [Release, Debug]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
 
       - name: Install JS dependencies
-        run: npm install
+        run: npm ci
 
       - name: Generate native iOS project
         run: npx expo prebuild --platform ios --no-install && cd ios && pod install
+
+      - name: Cache DerivedData
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: derived-${{ matrix.configuration }}-${{ hashFiles('package-lock.json', 'app.json') }}
+          restore-keys: derived-${{ matrix.configuration }}-
 
       - name: Build (no code signing)
         run: |
@@ -27,7 +40,7 @@ jobs:
           xcodebuild \
             -workspace HeartratePro.xcworkspace \
             -scheme HeartratePro \
-            -configuration Release \
+            -configuration ${{ matrix.configuration }} \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -derivedDataPath ../build \
@@ -37,10 +50,10 @@ jobs:
       - name: Package IPA
         run: |
           mkdir -p Payload
-          cp -R build/Build/Products/Release-iphoneos/HeartratePro.app Payload/
-          zip -qry HeartratePro-unsigned.ipa Payload
+          cp -R build/Build/Products/${{ matrix.configuration }}-iphoneos/HeartratePro.app Payload/
+          zip -qry HeartratePro-${{ matrix.configuration }}-unsigned.ipa Payload
 
       - uses: actions/upload-artifact@v4
         with:
-          name: HeartratePro-unsigned-ipa
-          path: HeartratePro-unsigned.ipa
+          name: HeartratePro-${{ matrix.configuration }}-unsigned-ipa
+          path: HeartratePro-${{ matrix.configuration }}-unsigned.ipa
