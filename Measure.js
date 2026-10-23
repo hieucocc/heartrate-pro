@@ -10,6 +10,7 @@ import {
 import { Worklets } from 'react-native-worklets-core';
 import * as Haptics from 'expo-haptics';
 import { PulseEngine } from './ppg';
+import { canLockCamera, setCameraLocked } from './cameraLock';
 import { Heart, Ring, TabIcon, Wave } from './ui';
 
 const MEASURE_SECONDS = 20;
@@ -19,7 +20,8 @@ const DARK = { accent: ACCENT, soft: '#2B1A20', text: '#fff' };
 
 const TICK_MS = 66;               // UI refresh (~15 fps)
 const WAVE_SAMPLES = 120;         // 4 s of signal on screen
-const EXPOSURE_WINDOW = 4000;     // only tune exposure in the first ms after the finger lands
+const EXPOSURE_WINDOW = 3000;     // only tune exposure bias in the first ms after the finger lands
+const LOCK_AFTER_MS = 700;        // auto-exposure settling time before the lock
 
 // Scale from a robust spread so one outlier does not flatten the drawn wave; eased by the caller.
 function waveSpan(v) {
@@ -31,7 +33,9 @@ function waveSpan(v) {
 
 export default function Measure({ onClose, onDone, haptics }) {
   const { hasPermission, requestPermission } = useCameraPermission();
-  const device = useCameraDevice('back');
+  // The plain wide-angle lens sits next to the torch, and it is the device the exposure lock targets.
+  const device = useCameraDevice('back', { physicalDevices: ['wide-angle-camera'] });
+  const locked = useRef(false);
   const format = useCameraFormat(device, [{ videoResolution: { width: 640, height: 480 } }, { fps: 30 }]);
   const engine = useRef(new PulseEngine());
   const latest = useRef(null);
@@ -52,15 +56,28 @@ export default function Measure({ onClose, onDone, haptics }) {
     if (!hasPermission) requestPermission();
   }, [hasPermission, requestPermission]);
 
-  const onSample = useCallback((t, r, g, b) => {
-    latest.current = engine.current.push(t, r, g, b);
+  useEffect(() => () => {
+    if (locked.current) setCameraLocked(false).catch(() => {});
+  }, []);
+
+  const rawLog = useRef([]);
+  const onSample = useCallback((t, r, g, b, clip) => {
+    latest.current = { ...engine.current.push(t, r, g, b), clip };
+    // Raw frames streamed to Metro in chunks so the pipeline can be tuned offline on real recordings.
+    const buf = rawLog.current;
+    buf.push(`${t.toFixed(3)},${r.toFixed(2)},${g.toFixed(2)},${b.toFixed(2)},${clip.toFixed(2)}`);
+    if (buf.length >= 60) {
+      console.log(`[RAW] ${buf.join(';')}`);
+      rawLog.current = [];
+    }
   }, []);
   const onSampleJS = Worklets.createRunOnJS(onSample);
 
   const frameProcessor = useFrameProcessor(
     (frame) => {
       'worklet';
-      // iOS 'rgb' frames are BGRA, 4 bytes per pixel. Average the whole frame on a coarse grid.
+      // iOS 'rgb' frames are BGRA, 4 bytes per pixel. Average on a coarse grid, skipping pixels the torch
+      // blows out: a clipped pixel cannot change with the pulse and only dilutes it.
       const buf = new Uint8Array(frame.toArrayBuffer());
       const w = frame.width;
       const h = frame.height;
@@ -69,16 +86,31 @@ export default function Measure({ onClose, onDone, haptics }) {
       let g = 0;
       let b = 0;
       let n = 0;
-      for (let y = 0; y < h; y += 8) {
-        for (let x = 0; x < w; x += 8) {
+      let ar = 0;
+      let ag = 0;
+      let ab = 0;
+      let all = 0;
+      for (let y = 0; y < h; y += 6) {
+        for (let x = 0; x < w; x += 6) {
           const i = y * stride + x * 4;
-          b += buf[i];
-          g += buf[i + 1];
-          r += buf[i + 2];
-          n++;
+          const pb = buf[i];
+          const pg = buf[i + 1];
+          const pr = buf[i + 2];
+          ab += pb;
+          ag += pg;
+          ar += pr;
+          all++;
+          if (pr < 250 && pg < 250) {
+            b += pb;
+            g += pg;
+            r += pr;
+            n++;
+          }
         }
       }
-      if (n > 0) onSampleJS(Date.now() / 1000, r / n, g / n, b / n);
+      const t = Date.now() / 1000;
+      if (n > all * 0.1) onSampleJS(t, r / n, g / n, b / n, 1 - n / all);
+      else if (all > 0) onSampleJS(t, ar / all, ag / all, ab / all, 1 - n / all);
     },
     [onSampleJS],
   );
@@ -98,14 +130,24 @@ export default function Measure({ onClose, onDone, haptics }) {
       if (!s.finger) fingerSince.current = null;
       else if (fingerSince.current === null) fingerSince.current = Date.now();
 
-      // Keep the red channel away from clipping, but only right after the finger lands: every step
-      // restarts the signal, and once measuring the green channel covers a clipped red one.
-      const tuning = fingerSince.current !== null && Date.now() - fingerSince.current < EXPOSURE_WINDOW;
-      if (device && tuning && ticks.current % 5 === 0) {
+      // Like InPulse: let auto-exposure settle on the lit finger, then lock it, because a live auto-exposure
+      // brightens and darkens the frame against every heartbeat. Builds without the lock module instead
+      // nudge the exposure bias, only in the first seconds since every step restarts the signal.
+      const since = fingerSince.current === null ? null : Date.now() - fingerSince.current;
+      if (canLockCamera()) {
+        if (since !== null && since > LOCK_AFTER_MS && !locked.current) {
+          locked.current = true;
+          setCameraLocked(true)
+            .then(() => engine.current.exposureChanged())
+            .catch(() => {});
+        } else if (since === null && locked.current) {
+          locked.current = false;
+          setCameraLocked(false).catch(() => {});
+        }
+      } else if (device && since !== null && since < EXPOSURE_WINDOW && ticks.current % 5 === 0) {
         const step = (device.maxExposure - device.minExposure) / 16;
         const e = expoRef.current;
-        const next =
-          s.rgb[0] > 240 ? Math.max(device.minExposure, e - step) : s.rgb[0] < 130 ? Math.min(device.maxExposure, e + step) : e;
+        const next = s.clip > 0.3 ? Math.max(device.minExposure, e - step) : s.rgb[0] < 110 ? Math.min(device.maxExposure, e + step) : e;
         if (next !== e) {
           setExpo(next);
           engine.current.exposureChanged();

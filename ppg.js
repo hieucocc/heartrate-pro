@@ -1,21 +1,22 @@
-// Streaming PPG engine: finger gating -> uniform resample -> band-pass -> beat detection + autocorrelation -> BPM/HRV.
-// Red and green are tracked separately; whichever has the clearer periodic signal drives the result
-// (under the torch red often clips while green still carries the pulse).
+// Streaming PPG engine: finger gating -> uniform resample -> band-pass -> beat detection -> RR intervals -> BPM/HRV.
+// Like InPulse, the rate comes from beat-to-beat (RR) intervals: outliers are rejected against the running median
+// and the shown BPM is the median of the recent intervals, so single bad beats do not move it.
+// Red and green are tracked separately; whichever beats more regularly drives the result.
 
 const FS = 30;                    // target sample rate (Hz)
-const BAND = [0.5, 3.6];          // pass band (Hz)
-const SECTIONS_Q = [0.5176, 0.7071, 1.9319]; // Butterworth order-6 section Qs
-const LAG = FS * 4;               // z-score window (samples)
-const Z_THRESHOLD = 0.1;
-const Z_INFLUENCE = 0.5;
-const MIN_RUN = 4;                // samples a run must exceed to count as a beat
+const BAND = [0.6, 3.0];          // pass band (Hz); a low top edge keeps the dicrotic bump small
+const SECTIONS_Q = [0.5412, 1.3066]; // Butterworth order-4 section Qs
 const MIN_FPS = 10;
 const MAX_GAP = 2;                // seconds between frames before we reset
-const MIN_BEATS = 5;
-const INTERVAL_TOL = 0.2;         // seconds around the central interval
-const BPM_RANGE = [40, 200];
+const RR_RANGE = [0.3, 1.4];      // seconds (200-43 BPM)
+const RR_TOL = 0.22;              // max relative deviation from the running median
+const RR_WINDOW = 8;              // intervals in the median
+const MIN_RR = 3;                 // intervals before a BPM is shown
+const FINGER_FRAMES = 6;          // frames of finger before we start (0.2 s)
 const LOST_FINGER_FRAMES = FS * 0.5;
-const DC_ALPHA = 0.02;            // slow mean used to normalise each channel (AC/DC)
+const WARM = FS;                  // filter settling samples
+const PEAK_HALF = 9;              // samples each side a beat must dominate (0.3 s)
+const DC_ALPHA = 0.05;           // slow mean used to normalise each channel (AC/DC)
 
 function biquad(type, f, q) {
   const w = (2 * Math.PI * f) / FS;
@@ -35,11 +36,16 @@ function step(s, x) {
 }
 
 const mean = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+const median = (a) => {
+  const s = [...a].sort((x, y) => x - y);
+  const m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+};
 
 // Camera exposure varies, so judge "finger" by colour ratios rather than absolute levels.
-export const isFinger = (r, g, b) => r > 80 && g < r * 0.75 && b < r * 0.6;
+export const isFinger = (r, g, b) => r > 60 && g < r * 0.75 && b < r * 0.75;
 
-// One colour channel: filter, peak finder and autocorrelation.
+// One colour channel: filter, beat detector and RR intervals.
 class Track {
   constructor() {
     this.sections = [
@@ -47,116 +53,120 @@ class Track {
       ...SECTIONS_Q.map((q) => biquad('lp', BAND[1], q)),
     ];
     this.dc = null;
-    this.filtered = [];
-    this.raw = [];
-    this.run = [];
-    this.peaks = [];
-    this.peakBpm = null;
-    this.acBpm = null;
-    this.strength = 0;
+    this.raw = [];             // band-passed signal with times
+    this.lastBeat = null;
+    this.peaks = [];           // accepted beat times
+    this.rr = [];              // accepted intervals (s)
+    this.tried = 0;
+    this.kept = 0;
   }
 
   filter(x) {
     if (this.dc === null) this.dc = x;
     this.dc += DC_ALPHA * (x - this.dc);
     // Normalised and inverted so systole (less light through the finger) reads as a peak.
-    let y = -(x / (this.dc || 1) - 1);
+    let y = -(x / (this.dc || 1) - 1) * 1000;
     for (const s of this.sections) y = step(s, y);
     return y;
   }
 
-  push(y, t, n) {
+  push(y, t) {
     this.raw.push({ t, y });
     if (this.raw.length > FS * 12) this.raw.shift();
-    if (n % (FS / 2) === 0) this.autocorr();
+    const n = this.raw.length;
+    if (n % (FS / 2) === 0) this.spectral();
+    // Once the dominant rate is known a beat must dominate 40% of a period either side, else 0.3 s.
+    const half = this.specHz ? Math.max(6, Math.min(18, Math.round((0.4 * FS) / this.specHz))) : PEAK_HALF;
+    if (n < 2 * half + 1) return;
+    // The sample `half` back is a beat if it is the maximum of its +-half neighbourhood,
+    // which also skips the smaller dicrotic bump that follows each beat.
+    const c = this.raw[n - 1 - half];
+    for (let i = n - 1 - 2 * half; i < n; i++) if (this.raw[i].y > c.y) return;
+    // Interpolate the peak position between samples for finer intervals.
+    const a = this.raw[n - 2 - half].y;
+    const b = this.raw[n - half].y;
+    const den = a - 2 * c.y + b;
+    const tb = c.t + (den ? (0.5 * (a - b)) / den / FS : 0);
+    if (c.y <= 0) return;
+    // Gate against the tallest recent peak, so dicrotic bumps cannot drag the threshold down.
+    this.heights = (this.heights || []).filter((h) => tb - h.t < 2.5);
+    const top = Math.max(0, ...this.heights.map((h) => h.y));
+    this.heights.push({ t: tb, y: c.y });
+    if (c.y < top * 0.5) return;
+    if (this.lastBeat !== null) this.addInterval(tb - this.lastBeat);
+    this.lastBeat = tb;
+    this.peaks.push(tb);
+    if (this.peaks.length > 60) this.peaks.shift();
+  }
 
-    const f = this.filtered;
-    if (f.length < LAG) {
-      f.push(y);
-      return;
+  addInterval(d) {
+    if (d < RR_RANGE[0] || d > RR_RANGE[1]) return;
+    this.tried++;
+    if (this.rr.length >= MIN_RR) {
+      const m = median(this.rr.slice(-RR_WINDOW));
+      if (Math.abs(d - m) / m > RR_TOL) {
+        // A run of rejected beats means the rate itself changed: start over from the new rhythm.
+        this.misses = (this.misses || 0) + 1;
+        if (this.misses >= 4) {
+          this.rr = [d];
+          this.misses = 0;
+        }
+        return;
+      }
     }
-    const win = f.slice(-LAG);
-    const avg = mean(win);
-    const sd = Math.sqrt(mean(win.map((x) => (x - avg) ** 2)));
-    if (Math.abs(y - avg) <= Z_THRESHOLD * sd) {
-      f.push(y);
-      this.endRun();
-      return;
-    }
-    f.push(Z_INFLUENCE * y + (1 - Z_INFLUENCE) * f[f.length - 1]);
-    if (y > avg) this.run.push({ t, y });
-    else this.endRun();
-    if (f.length > LAG * 3) f.splice(0, f.length - LAG * 2);
+    this.misses = 0;
+    this.kept++;
+    this.rr.push(d);
+    if (this.rr.length > 60) this.rr.shift();
   }
 
-  endRun() {
-    if (this.run.length > MIN_RUN) {
-      const top = this.run.reduce((m, p) => (p.y > m.y ? p : m));
-      this.peaks.push(top.t);
-      if (this.peaks.length > 60) this.peaks.shift();
-      this.updateBpm();
-    }
-    this.run = [];
-  }
-
-  intervals() {
-    const out = [];
-    for (let i = 1; i < this.peaks.length; i++) out.push(this.peaks[i] - this.peaks[i - 1]);
-    return out;
-  }
-
-  updateBpm() {
-    if (this.peaks.length <= MIN_BEATS) return;
-    const iv = this.intervals().slice(-15);
-    const c = mean(iv);
-    const kept = iv.filter((d) => d > c - INTERVAL_TOL && d < c + INTERVAL_TOL);
-    if (kept.length < 3) return;
-    const bpm = 60 / mean(kept);
-    if (bpm >= BPM_RANGE[0] && bpm <= BPM_RANGE[1]) this.peakBpm = Math.round(bpm);
-  }
-
-  // Dominant period of the band-passed signal over the last ~8 s. Robust when individual peaks are noisy.
-  autocorr() {
-    const n = Math.min(this.raw.length, FS * 8);
+  // Dominant pulse frequency over the last 6 s. Each candidate also scores its second harmonic, and a
+  // candidate at half the frequency wins when it explains the spectrum nearly as well, so a strong
+  // dicrotic harmonic cannot double the rate.
+  spectral() {
+    const n = Math.min(this.raw.length, FS * 6);
     if (n < FS * 3) return;
     const x = this.raw.slice(-n).map((p) => p.y);
-    const m = mean(x);
-    const v = x.map((a) => a - m);
-    const var0 = v.reduce((s, a) => s + a * a, 0) / n;
-    if (var0 < 1e-12) return;
-    const minLag = Math.floor((FS * 60) / BPM_RANGE[1]);
-    const maxLag = Math.min(Math.ceil((FS * 60) / BPM_RANGE[0]), n - FS);
-    const r = {};
-    for (let lag = minLag - 1; lag <= maxLag + 1; lag++) {
-      let s = 0;
-      for (let i = 0; i + lag < n; i++) s += v[i] * v[i + lag];
-      r[lag] = s / (n - lag) / var0;
+    const power = (f) => {
+      let re = 0;
+      let im = 0;
+      for (let i = 0; i < n; i++) {
+        const w = (0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (n - 1))) * x[i];
+        const ph = (2 * Math.PI * f * i) / FS;
+        re += w * Math.cos(ph);
+        im += w * Math.sin(ph);
+      }
+      return re * re + im * im;
+    };
+    let best = null;
+    let total = 0;
+    const scores = [];
+    for (let f = BAND[0]; f <= BAND[1]; f += 0.025) {
+      const p = power(f);
+      total += p;
+      scores.push({ f, p, s: p + 0.5 * power(2 * f) });
     }
-    const maxima = [];
-    for (let lag = minLag; lag <= maxLag; lag++) {
-      if (r[lag] > r[lag - 1] && r[lag] >= r[lag + 1]) maxima.push(lag);
-    }
-    if (!maxima.length) {
-      this.strength *= 0.8;
-      return;
-    }
-    const best = Math.max(...maxima.map((l) => r[l]));
-    // Smallest lag that is nearly as strong as the best one (avoids picking a sub-harmonic).
-    const lag = maxima.find((l) => r[l] >= best * 0.85);
-    const a = r[lag - 1];
-    const b = r[lag];
-    const c = r[lag + 1];
-    const denom = a - 2 * b + c;
-    const shift = denom ? (0.5 * (a - c)) / denom : 0;
-    this.acBpm = Math.round((60 * FS) / (lag + shift));
-    this.strength = Math.max(0, Math.min(1, b));
+    for (const c of scores) if (!best || c.s > best.s) best = c;
+    const half = scores.find((c) => Math.abs(c.f - best.f / 2) < 0.03);
+    if (half && half.s > best.s * 0.6) best = half;
+    this.specHz = best.f;
+    this.specShare = total ? best.p / total : 0;
   }
 
   bpm() {
-    if (this.acBpm && this.peakBpm) {
-      return Math.abs(this.peakBpm - this.acBpm) / this.acBpm < 0.08 ? this.peakBpm : this.acBpm;
-    }
-    return this.acBpm || this.peakBpm;
+    if (this.rr.length < MIN_RR) return null;
+    return 60 / median(this.rr.slice(-RR_WINDOW));
+  }
+
+  // 0..1 from how regular the recent intervals are and how many beats were accepted.
+  quality() {
+    const iv = this.rr.slice(-RR_WINDOW);
+    if (iv.length < MIN_RR) return 0;
+    const m = mean(iv);
+    const cv = Math.sqrt(mean(iv.map((d) => (d - m) ** 2))) / m;
+    const regular = Math.max(0, 1 - cv * 6);
+    const accepted = this.tried ? this.kept / this.tried : 0;
+    return Math.max(0, Math.min(1, regular * (0.4 + 0.6 * accepted)));
   }
 }
 
@@ -182,7 +192,7 @@ export class PulseEngine {
     this.prev = null;
     this.nextGrid = null;
     this.warm = 0;
-    this.smoothBpm = null;
+    this.shown = null;
   }
 
   // A camera exposure step looks like a huge pulse to the filters: restart the signal and the warm-up.
@@ -196,7 +206,7 @@ export class PulseEngine {
 
   get best() {
     const [r, g] = this.tracks;
-    return g.strength > r.strength ? g : r;
+    return g.quality() > r.quality() ? g : r;
   }
 
   // r, g, b: mean 0..255 over the frame. Returns a status snapshot.
@@ -216,7 +226,7 @@ export class PulseEngine {
     }
     this.bad = 0;
     this.stable++;
-    if (this.state === 0 && this.stable > FS / 2) {
+    if (this.state === 0 && this.stable >= FINGER_FRAMES) {
       this.state = 1;
       this.startT = t;
     }
@@ -227,7 +237,7 @@ export class PulseEngine {
       return this.status(true);
     }
     this.feed(t, [r, g]);
-    if (this.state === 1 && t - this.startT > 3) this.state = 2;
+    if (this.state === 1 && this.best.bpm()) this.state = 2;
     return this.status(true);
   }
 
@@ -248,19 +258,16 @@ export class PulseEngine {
       this.warm++;
       this.tracks.forEach((tr, k) => {
         const y = tr.filter(v0[k] + f * (v[k] - v0[k]));
-        if (this.warm > FS / 2) tr.push(y, this.nextGrid, this.warm);
+        if (this.warm > WARM) tr.push(y, this.nextGrid);
       });
       this.nextGrid += 1 / FS;
     }
     this.prev = { t, v };
   }
 
-  // Time-domain HRV from the kept beat-to-beat intervals (ms).
+  // Time-domain HRV from the accepted beat-to-beat intervals (ms).
   hrv() {
-    const iv = this.best.intervals();
-    if (iv.length < 5) return null;
-    const c = mean(iv);
-    const rr = iv.filter((d) => Math.abs(d - c) < INTERVAL_TOL).map((d) => d * 1000);
+    const rr = this.best.rr.map((d) => d * 1000);
     if (rr.length < 5) return null;
     const m = mean(rr);
     const diffs = rr.slice(1).map((d, i) => d - rr[i]);
@@ -274,15 +281,16 @@ export class PulseEngine {
   status(finger) {
     const tr = this.best;
     const raw = tr.bpm();
-    // Light smoothing so the displayed number does not jump between estimates.
-    if (raw) this.smoothBpm = this.smoothBpm ? this.smoothBpm + 0.05 * (raw - this.smoothBpm) : raw;
-    const bpm = this.smoothBpm ? Math.round(this.smoothBpm) : null;
+    // Ease toward the median so the number glides instead of stepping.
+    if (raw) this.shown = this.shown ? this.shown + 0.08 * (raw - this.shown) : raw;
+    const bpm = this.shown ? Math.round(this.shown) : null;
+    const strength = tr.quality();
     return {
       finger,
       state: this.state,
       bpm,
-      strength: tr.strength,
-      confidence: bpm ? Math.min(99, Math.round(tr.strength * 130)) : 0,
+      strength,
+      confidence: bpm ? Math.min(99, Math.round(strength * 100)) : 0,
       beats: tr.peaks.length,
       channel: tr === this.tracks[1] ? 'G' : 'R',
       fps: this.fps,
