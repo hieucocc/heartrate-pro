@@ -1,6 +1,14 @@
 import React from 'react';
-import { Alert, Pressable, ScrollView, Switch, Text, View } from 'react-native';
+import { Alert, Linking, Pressable, ScrollView, Switch, Text, View } from 'react-native';
 import { Heart, TabIcon } from './ui';
+import { healthAvailable, requestHealth } from './health';
+
+// [setting value, icon, label]
+const THEMES = [
+  ['system', 'system', 'System'],
+  ['light', 'sun', 'Light'],
+  ['dark', 'moon', 'Dark'],
+];
 
 const Section = ({ t, title, children }) => (
   <>
@@ -32,20 +40,52 @@ export default function Settings({ t, state, onChange, onClear }) {
     <Switch value={s[key]} onValueChange={(v) => onChange({ ...s, [key]: v })} trackColor={{ true: t.accent }} />
   );
   const soon = <Text style={{ color: t.sub, fontSize: 12 }}>Coming soon</Text>;
+  const toggleHealth = async (on) => {
+    if (!on) return onChange({ ...s, health: false });
+    try {
+      await requestHealth();
+      onChange({ ...s, health: true });
+    } catch (e) {
+      Alert.alert('Apple Health', `Could not connect: ${e.message}`);
+    }
+  };
   return (
     <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 20, paddingBottom: 24 }}>
       <Text style={{ color: t.text, fontSize: 26, fontWeight: '700' }}>Settings</Text>
 
       <View style={{ marginTop: 16, backgroundColor: t.card, borderRadius: 16, overflow: 'hidden' }}>
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12, padding: 14, opacity: 0.6 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12, padding: 14 }}>
           <Heart size={36} t={t} />
           <View style={{ flex: 1 }}>
-            <Text style={{ color: t.text, fontSize: 15 }}>Health Integration</Text>
-            <Text style={{ color: t.sub, fontSize: 11 }}>Sync with Apple Health</Text>
+            <Text style={{ color: t.text, fontSize: 15 }}>Apple Health</Text>
+            <Text style={{ color: t.sub, fontSize: 11 }}>
+              {healthAvailable() ? 'Save each measurement to Health' : 'Needs the latest app build'}
+            </Text>
           </View>
-          {soon}
+          <Switch value={s.health} onValueChange={toggleHealth} trackColor={{ true: t.accent }} disabled={!healthAvailable()} />
         </View>
       </View>
+
+      <Section t={t} title="Appearance">
+        <View style={{ flexDirection: 'row', padding: 6, gap: 6 }}>
+          {THEMES.map(([key, icon, label]) => {
+            const on = s.theme === key;
+            return (
+              <Pressable
+                key={key}
+                onPress={() => onChange({ ...s, theme: key })}
+                style={{
+                  flex: 1, alignItems: 'center', gap: 6, paddingVertical: 12, borderRadius: 12,
+                  backgroundColor: on ? t.soft : 'transparent',
+                }}
+              >
+                <TabIcon name={icon} color={on ? t.accent : t.sub} size={22} />
+                <Text style={{ color: on ? t.accent : t.text, fontSize: 13, fontWeight: on ? '600' : '400' }}>{label}</Text>
+              </Pressable>
+            );
+          })}
+        </View>
+      </Section>
 
       <Section t={t} title="Reminders">
         <Row t={t} label="Heart Rate Reminder" right={soon} disabled />
@@ -80,10 +120,17 @@ export default function Settings({ t, state, onChange, onClear }) {
           right={<TabIcon name="chevron" color={t.sub} size={16} />}
           last
           onPress={() =>
-            Alert.alert('Pulse', 'Version 1.0.0\n\nCamera-based heart rate measurements are for wellness tracking and are not a substitute for medical evaluation.')
+            Alert.alert('Pulse', 'Version 1.0.0\nMade by @hieucocc\n\nCamera-based heart rate measurements are for wellness tracking and are not a substitute for medical evaluation.')
           }
         />
       </Section>
+
+      <Pressable onPress={() => Linking.openURL('https://github.com/hieucocc')} style={{ alignItems: 'center', marginTop: 28 }}>
+        <Text style={{ color: t.sub, fontSize: 12 }}>
+          Made with <Text style={{ color: t.accent }}>♥</Text> by <Text style={{ color: t.text, fontWeight: '600' }}>@hieucocc</Text>
+        </Text>
+        <Text style={{ color: t.sub, fontSize: 11, marginTop: 4 }}>Pulse v1.0.0</Text>
+      </Pressable>
     </ScrollView>
   );
 }

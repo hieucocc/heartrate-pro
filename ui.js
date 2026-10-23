@@ -1,24 +1,31 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Animated, Easing, Pressable, Text, View } from 'react-native';
 import Svg, { Circle, Defs, LinearGradient, Path, Polyline, Stop } from 'react-native-svg';
+import {
+  Activity, ChartColumn, ChevronLeft, ChevronRight, HeartPulse, History, House, Moon, Settings, Share, Sun, SunMoon, X, Zap,
+} from 'lucide-react-native';
 
 const HEART =
   'M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z';
 
 // Heart with an ECG line, on a soft circle.
-export function Heart({ size = 48, t, bare = false, animate = false }) {
+// With `bpm`, the beat follows the measured rate.
+export function Heart({ size = 48, t, bare = false, animate = false, bpm = 60 }) {
   const scale = useRef(new Animated.Value(1)).current;
+  // Quantised so small BPM changes do not restart the loop mid-beat.
+  const period = 60000 / (Math.round(Math.min(200, Math.max(40, bpm || 60)) / 5) * 5);
   useEffect(() => {
     if (!animate) return undefined;
     const loop = Animated.loop(
       Animated.sequence([
-        Animated.timing(scale, { toValue: 1.1, duration: 350, easing: Easing.out(Easing.quad), useNativeDriver: true }),
-        Animated.timing(scale, { toValue: 1, duration: 650, easing: Easing.in(Easing.quad), useNativeDriver: true }),
+        Animated.timing(scale, { toValue: 1.12, duration: period * 0.18, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+        Animated.timing(scale, { toValue: 1, duration: period * 0.42, easing: Easing.inOut(Easing.cubic), useNativeDriver: true }),
+        Animated.delay(period * 0.4),
       ]),
     );
     loop.start();
     return () => loop.stop();
-  }, [animate, scale]);
+  }, [animate, scale, period]);
   const icon = (
     <Animated.View style={{ transform: [{ scale }] }}>
       <Svg width={size * 0.62} height={size * 0.62} viewBox="0 0 24 24">
@@ -102,14 +109,18 @@ export function Chart({ t, points, xDomain, yDomain = [40, 120], yTicks = [120, 
 }
 
 // Plain wave line from a list of numbers (no axes).
-export function Wave({ values, width, height, color, fade = false }) {
+// `domain` fixes the vertical scale (pass a smoothed one for live data so the line does not rescale every frame).
+export function Wave({ values, width, height, color, fade = false, domain }) {
   const id = useRef(`w${uid++}`).current;
   const v = values && values.length > 1 ? values : null;
   if (!v) return <View style={{ width, height }} />;
-  const lo = Math.min(...v);
-  const hi = Math.max(...v);
+  const lo = domain ? domain[0] : Math.min(...v);
+  const hi = domain ? domain[1] : Math.max(...v);
   const span = hi - lo || 1;
-  const pts = v.map((y, i) => ({ x: (i / (v.length - 1)) * width, y: height - 4 - ((y - lo) / span) * (height - 8) }));
+  const pts = v.map((y, i) => ({
+    x: (i / (v.length - 1)) * width,
+    y: height - 4 - Math.min(1, Math.max(0, (y - lo) / span)) * (height - 8),
+  }));
   const d = smooth(pts);
   return (
     <Svg width={width} height={height}>
@@ -127,13 +138,25 @@ export function Wave({ values, width, height, color, fade = false }) {
   );
 }
 
-export function Ring({ size, stroke, progress, color, track }) {
+const AnimatedCircle = Animated.createAnimatedComponent(Circle);
+
+// Progress ring that glides between updates instead of jumping.
+export function Ring({ size, stroke, progress, color, track, duration = 250 }) {
   const r = (size - stroke) / 2;
   const c = 2 * Math.PI * r;
+  const p = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(p, {
+      toValue: Math.min(1, Math.max(0, progress)),
+      duration,
+      easing: Easing.linear,
+      useNativeDriver: false,
+    }).start();
+  }, [progress, duration, p]);
   return (
     <Svg width={size} height={size}>
       <Circle cx={size / 2} cy={size / 2} r={r} stroke={track} strokeWidth={stroke} fill="none" />
-      <Circle
+      <AnimatedCircle
         cx={size / 2}
         cy={size / 2}
         r={r}
@@ -141,7 +164,8 @@ export function Ring({ size, stroke, progress, color, track }) {
         strokeWidth={stroke}
         fill="none"
         strokeLinecap="round"
-        strokeDasharray={`${c * Math.min(1, Math.max(0.01, progress))} ${c}`}
+        strokeDasharray={`${c} ${c}`}
+        strokeDashoffset={p.interpolate({ inputRange: [0, 1], outputRange: [c, 0] })}
         rotation="-90"
         origin={`${size / 2},${size / 2}`}
       />
@@ -149,32 +173,26 @@ export function Ring({ size, stroke, progress, color, track }) {
   );
 }
 
+const ICONS = {
+  home: House,
+  trends: ChartColumn,
+  history: History,
+  settings: Settings,
+  close: X,
+  back: ChevronLeft,
+  chevron: ChevronRight,
+  share: Share,
+  pulse: Activity,
+  bolt: Zap,
+  sun: Sun,
+  moon: Moon,
+  system: SunMoon,
+  health: HeartPulse,
+};
+
 export function TabIcon({ name, color, size = 24 }) {
-  const p = { stroke: color, strokeWidth: 1.8, fill: 'none', strokeLinecap: 'round', strokeLinejoin: 'round' };
-  return (
-    <Svg width={size} height={size} viewBox="0 0 24 24">
-      {name === 'home' && <Path d="M4 11l8-7 8 7v9a1 1 0 0 1-1 1h-4v-6H9v6H5a1 1 0 0 1-1-1z" {...p} fill={color} fillOpacity={0.15} />}
-      {name === 'trends' && <Path d="M5 20v-8M12 20V5M19 20v-5" {...p} strokeWidth={2.6} />}
-      {name === 'history' && (
-        <>
-          <Circle cx="12" cy="12" r="8.5" {...p} />
-          <Path d="M12 7v5l3 2" {...p} />
-        </>
-      )}
-      {name === 'settings' && (
-        <>
-          <Circle cx="12" cy="12" r="3" {...p} />
-          <Path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M5.6 18.4l1.8-1.8M16.6 7.4l1.8-1.8" {...p} />
-        </>
-      )}
-      {name === 'close' && <Path d="M6 6l12 12M18 6L6 18" {...p} strokeWidth={2} />}
-      {name === 'back' && <Path d="M15 5l-7 7 7 7" {...p} strokeWidth={2} />}
-      {name === 'chevron' && <Path d="M9 5l7 7-7 7" {...p} strokeWidth={2} />}
-      {name === 'share' && <Path d="M12 15V4M8 8l4-4 4 4M5 13v6a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-6" {...p} />}
-      {name === 'pulse' && <Polyline points="2,12 7,12 9.5,6 14,18 16.5,12 22,12" {...p} strokeWidth={2} />}
-      {name === 'bolt' && <Path d="M13 3L5 14h6l-1 7 8-11h-6z" {...p} fill={color} />}
-    </Svg>
-  );
+  const Icon = ICONS[name];
+  return <Icon color={color} size={size} strokeWidth={2} />;
 }
 
 export const Card = ({ t, style, children }) => (

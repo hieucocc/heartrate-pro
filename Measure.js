@@ -17,13 +17,16 @@ const GIVE_UP_SECONDS = 60;
 const ACCENT = '#FF4D6A';
 const DARK = { accent: ACCENT, soft: '#2B1A20', text: '#fff' };
 
-// Clip spikes so one outlier does not flatten the drawn wave.
-function displayWave(points) {
-  const v = points.slice(-150).map((p) => p.y);
-  if (v.length < 2) return v;
+const TICK_MS = 66;               // UI refresh (~15 fps)
+const WAVE_SAMPLES = 120;         // 4 s of signal on screen
+const EXPOSURE_WINDOW = 4000;     // only tune exposure in the first ms after the finger lands
+
+// Scale from a robust spread so one outlier does not flatten the drawn wave; eased by the caller.
+function waveSpan(v) {
+  if (v.length < 2) return null;
   const m = v.reduce((a, b) => a + b, 0) / v.length;
-  const sd = Math.sqrt(v.reduce((a, b) => a + (b - m) ** 2, 0) / v.length) || 1;
-  return v.map((y) => Math.max(m - 3 * sd, Math.min(m + 3 * sd, y)));
+  const sd = Math.sqrt(v.reduce((a, b) => a + (b - m) ** 2, 0) / v.length);
+  return sd ? [m - 2.5 * sd, m + 2.5 * sd] : null;
 }
 
 export default function Measure({ onClose, onDone, haptics }) {
@@ -35,7 +38,9 @@ export default function Measure({ onClose, onDone, haptics }) {
   const measureStart = useRef(null);
   const openedAt = useRef(Date.now());
   const ticks = useRef(0);
-  const [ui, setUi] = useState({ finger: false, bpm: null, strength: 0, progress: 0, wave: [], dbg: '' });
+  const fingerSince = useRef(null);
+  const domain = useRef(null);
+  const [ui, setUi] = useState({ finger: false, bpm: null, strength: 0, progress: 0, wave: [], domain: null, dbg: '' });
   const [expo, setExpo] = useState(0);
   const expoRef = useRef(0);
   expoRef.current = expo;
@@ -90,30 +95,47 @@ export default function Measure({ onClose, onDone, haptics }) {
       if (!s) return;
       ticks.current++;
 
-      // Keep the red channel away from clipping: lower exposure when it saturates, raise it when too dark.
-      if (device && ticks.current % 3 === 0 && s.finger && (s.state < 2 || s.rgb[0] > 250)) {
-        const step = (device.maxExposure - device.minExposure) / 24;
-        if (s.rgb[0] > 238) setExpo((e) => Math.max(device.minExposure, e - step));
-        else if (s.rgb[0] < 140) setExpo((e) => Math.min(device.maxExposure, e + step));
+      if (!s.finger) fingerSince.current = null;
+      else if (fingerSince.current === null) fingerSince.current = Date.now();
+
+      // Keep the red channel away from clipping, but only right after the finger lands: every step
+      // restarts the signal, and once measuring the green channel covers a clipped red one.
+      const tuning = fingerSince.current !== null && Date.now() - fingerSince.current < EXPOSURE_WINDOW;
+      if (device && tuning && ticks.current % 5 === 0) {
+        const step = (device.maxExposure - device.minExposure) / 16;
+        const e = expoRef.current;
+        const next =
+          s.rgb[0] > 240 ? Math.max(device.minExposure, e - step) : s.rgb[0] < 130 ? Math.min(device.maxExposure, e + step) : e;
+        if (next !== e) {
+          setExpo(next);
+          engine.current.exposureChanged();
+        }
       }
 
-      if (s.state === 0) measureStart.current = null;
+      if (s.state < 2) measureStart.current = null;
       else if (measureStart.current === null) measureStart.current = Date.now();
       const secs = measureStart.current ? (Date.now() - measureStart.current) / 1000 : 0;
-      if (ticks.current % 3 === 0) {
+      if (ticks.current % 15 === 0) {
         // Streams to the Metro terminal when running the dev client.
         console.log(
           `[PPG] finger=${s.finger} st=${s.state} R=${s.rgb[0].toFixed(0)} G=${s.rgb[1].toFixed(0)} B=${s.rgb[2].toFixed(0)} ` +
-            `fps=${s.fps.toFixed(1)} beats=${s.beats} bpm=${s.bpm} q=${s.strength.toFixed(2)} expo=${expoRef.current.toFixed(1)}`,
+            `fps=${s.fps.toFixed(1)} ch=${s.channel} beats=${s.beats} bpm=${s.bpm} q=${s.strength.toFixed(2)} expo=${expoRef.current.toFixed(1)}`,
         );
       }
+      const wave = s.wave.slice(-WAVE_SAMPLES).map((p) => p.y);
+      const target = waveSpan(wave);
+      if (target) {
+        const d = domain.current;
+        domain.current = d ? [d[0] + 0.12 * (target[0] - d[0]), d[1] + 0.12 * (target[1] - d[1])] : target;
+      } else domain.current = null;
       setUi({
         finger: s.finger,
         bpm: s.bpm,
         strength: s.strength,
         progress: secs / MEASURE_SECONDS,
-        wave: displayWave(s.wave),
-        dbg: `R${Math.round(s.rgb[0])} G${Math.round(s.rgb[1])} B${Math.round(s.rgb[2])}  ${s.fps.toFixed(0)}fps  st${s.state}  beats ${s.beats}  q${s.strength.toFixed(2)}`,
+        wave,
+        domain: domain.current,
+        dbg: `R${Math.round(s.rgb[0])} G${Math.round(s.rgb[1])} B${Math.round(s.rgb[2])}  ${s.fps.toFixed(0)}fps  st${s.state}  ${s.channel}  beats ${s.beats}  q${s.strength.toFixed(2)}`,
       });
       if (secs >= MEASURE_SECONDS && s.bpm && s.strength >= 0.3) {
         setActive(false);
@@ -127,7 +149,7 @@ export default function Measure({ onClose, onDone, haptics }) {
           wave: s.wave.filter((_, i) => i % step === 0).map((p) => +p.y.toFixed(3)),
         });
       }
-    }, 400);
+    }, TICK_MS);
     return () => clearInterval(id);
   }, [active, haptics, onDone, device]);
 
@@ -135,9 +157,11 @@ export default function Measure({ onClose, onDone, haptics }) {
     engine.current.reset();
     latest.current = null;
     measureStart.current = null;
+    fingerSince.current = null;
+    domain.current = null;
     openedAt.current = Date.now();
     setFailed(false);
-    setUi({ finger: false, bpm: null, strength: 0, progress: 0, wave: [], dbg: '' });
+    setUi({ finger: false, bpm: null, strength: 0, progress: 0, wave: [], domain: null, dbg: '' });
     setActive(true);
   };
 
@@ -145,9 +169,11 @@ export default function Measure({ onClose, onDone, haptics }) {
     ? null
     : !ui.bpm
       ? { label: 'Reading signal...', color: '#B5B5BF' }
-      : ui.strength >= 0.5
+      : ui.strength >= 0.45
         ? { label: 'Signal Good', color: '#34D27A' }
-        : { label: 'Weak Signal', color: '#FFAA33' };
+        : ui.strength >= 0.25
+          ? { label: 'Signal Fair', color: '#FFD23F' }
+          : { label: 'Weak Signal · press lightly, keep still', color: '#FFAA33' };
   const title = failed
     ? "Couldn't get a clear reading"
     : ui.finger
@@ -179,15 +205,15 @@ export default function Measure({ onClose, onDone, haptics }) {
       {debug && <Text style={styles.dbg}>{ui.dbg} exp{expo.toFixed(1)}</Text>}
 
       <View style={styles.ringBox}>
-        <Ring size={250} stroke={7} progress={ui.progress} color={ACCENT} track="#2A2A31" />
+        <Ring size={250} stroke={7} progress={ui.progress} color={ACCENT} track="#2A2A31" duration={TICK_MS} />
         <View style={styles.ringInner}>
-          <Heart size={64} t={DARK} bare animate />
+          <Heart size={64} t={DARK} bare animate bpm={ui.bpm} />
           <Text style={styles.bpm}>{ui.bpm ?? '--'}</Text>
           <Text style={styles.unit}>BPM</Text>
         </View>
       </View>
 
-      <Wave values={ui.wave} width={300} height={56} color={ACCENT} />
+      <Wave values={ui.wave} domain={ui.domain} width={300} height={56} color={ACCENT} />
 
       <View style={styles.quality}>
         {quality && (

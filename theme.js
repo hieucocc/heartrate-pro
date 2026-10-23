@@ -9,7 +9,11 @@ const dark = {
   accent: '#FF4D6A', soft: '#2B1A20', line: '#26262E', good: '#34D27A', blue: '#6AA3FF', amber: '#FFAA33',
 };
 
-export const useTheme = () => (useColorScheme() === 'dark' ? dark : light);
+// pref: 'system' | 'light' | 'dark'
+export function useTheme(pref = 'system') {
+  const system = useColorScheme();
+  return (pref === 'system' ? system : pref) === 'dark' ? dark : light;
+}
 
 export const rangeOf = (t, bpm) =>
   bpm < 60

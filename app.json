@@ -20,7 +20,14 @@
           "cameraPermissionText": "Camera is used to detect your pulse through your fingertip."
         }
       ],
-      "expo-asset"
+      "expo-asset",
+      [
+        "react-native-health",
+        {
+          "healthSharePermission": "Pulse reads your heart rate history from Apple Health.",
+          "healthUpdatePermission": "Pulse saves your heart rate measurements to Apple Health."
+        }
+      ]
     ]
   }
 }

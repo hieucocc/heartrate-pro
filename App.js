@@ -3,6 +3,7 @@ import { Modal, Pressable, StatusBar, Text, View } from 'react-native';
 import { useTheme } from './theme';
 import { TabIcon } from './ui';
 import { load, save } from './storage';
+import { saveHeartRate } from './health';
 import Home from './Home';
 import Trends from './Trends';
 import History from './History';
@@ -18,8 +19,8 @@ const TABS = [
 ];
 
 export default function App() {
-  const t = useTheme();
   const [state, setState] = useState(null);
+  const t = useTheme(state?.settings.theme);
   const [tab, setTab] = useState('home');
   const [measuring, setMeasuring] = useState(false);
   const [result, setResult] = useState(null); // {reading, saved}
@@ -98,6 +99,7 @@ export default function App() {
               onBack={() => setResult(null)}
               onSave={(note) => {
                 update((s) => ({ ...s, history: [{ ...result.reading, id: String(result.reading.ts), note }, ...s.history] }));
+                if (state.settings.health) saveHeartRate(result.reading.bpm, result.reading.ts).catch(() => {});
                 setResult(null);
                 setTab('home');
               }}

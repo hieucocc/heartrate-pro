@@ -1,7 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const KEY = 'pulse.v1';
-export const DEFAULTS = { history: [], settings: { haptics: true, animations: true } };
+export const DEFAULTS = { history: [], settings: { haptics: true, animations: true, theme: 'system', health: false } };
 
 export async function load() {
   try {
