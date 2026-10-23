@@ -125,7 +125,7 @@ class Track {
   // dicrotic harmonic cannot double the rate.
   spectral() {
     const n = Math.min(this.raw.length, FS * 6);
-    if (n < FS * 3) return;
+    if (n < FS * 2) return;
     const x = this.raw.slice(-n).map((p) => p.y);
     const power = (f) => {
       let re = 0;
@@ -213,7 +213,7 @@ export class PulseEngine {
   push(t, r, g, b) {
     this.rgb = [r, g, b];
     const finger = isFinger(r, g, b);
-    if (this.times.length && t - this.times[this.times.length - 1] > MAX_GAP) this.reset();
+    if (this.times.length && Math.abs(t - this.times[this.times.length - 1]) > MAX_GAP) this.reset();
     this.times.push(t);
     if (this.times.length > 60) this.times.shift();
     if (this.times.length >= 10) this.fps = (this.times.length - 1) / (t - this.times[0]);

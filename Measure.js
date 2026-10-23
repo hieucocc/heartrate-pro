@@ -108,7 +108,8 @@ export default function Measure({ onClose, onDone, haptics }) {
           }
         }
       }
-      const t = Date.now() / 1000;
+      // Camera presentation time (ms): monotonic and exact per frame, unlike the worklet's Date.now().
+      const t = frame.timestamp / 1000;
       if (n > all * 0.1) onSampleJS(t, r / n, g / n, b / n, 1 - n / all);
       else if (all > 0) onSampleJS(t, ar / all, ag / all, ab / all, 1 - n / all);
     },
@@ -233,6 +234,10 @@ export default function Measure({ onClose, onDone, haptics }) {
           torch={active ? 'on' : 'off'}
           exposure={expo}
           pixelFormat="rgb"
+          // Any frame-to-frame image processing smears or cancels the tiny pulse brightness change.
+          videoStabilizationMode="off"
+          videoHdr={false}
+          lowLightBoost={false}
           fps={30}
           frameProcessor={frameProcessor}
         />
