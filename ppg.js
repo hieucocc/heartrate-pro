@@ -24,6 +24,9 @@ const MIN_BEATS = 6;            // beats before a BPM is reported
 const RR_BAND = 0.2;            // s around the median interval
 const MEDIAN_WINDOW = 5;
 const BPM_RANGE = [40, 240];
+const REFRACTORY = 60 / 180;    // s; closer beats are merged (our addition)
+const MIN_KEPT = 6;             // agreeing intervals before a BPM is shown (our addition)
+const KEPT_SHARE = 0.5;
 
 function biquad(type, f, q) {
   const w = (2 * Math.PI * f) / FS;
@@ -93,6 +96,8 @@ export class PulseEngine {
     this.peaks = [];
     this.rr = [];
     this.bpmValue = null;
+    this.recent = [];
+    this.shown = null;
     this.kept = 0;
   }
 
@@ -212,9 +217,19 @@ export class PulseEngine {
     this.run = [];
     if (run.length <= MIN_RUN) return false;
     const top = run.reduce((a, b) => (b.y > a.y ? b : a));
+    // Our camera signal is weaker than InPulse's, so noise can split one beat into two runs. Two beats
+    // closer than a 180 BPM period are one beat: keep the taller.
     const prev = this.peaks[this.peaks.length - 1];
+    const refractory = this.rr.length >= 5 ? Math.max(REFRACTORY, 0.6 * median(this.rr)) : REFRACTORY;
+    if (prev !== undefined && top.t - prev < refractory) {
+      if (top.y <= this.lastPeakY) return false;
+      this.peaks.pop();
+      this.rr.pop();
+    }
+    const before = this.peaks[this.peaks.length - 1];
     this.peaks.push(top.t);
-    if (prev !== undefined) this.rr.push(top.t - prev);
+    this.lastPeakY = top.y;
+    if (before !== undefined) this.rr.push(top.t - before);
     return true;
   }
 
@@ -224,6 +239,9 @@ export class PulseEngine {
     const m = median(iv);
     const kept = iv.filter((d) => d > m - RR_BAND && d < m + RR_BAND);
     this.kept = kept.length;
+    // Report only once most intervals agree; InPulse shows its first number with fewer, but on our weaker
+    // signal that first number is the one that jumps around.
+    if (kept.length < MIN_KEPT || kept.length < iv.length * KEPT_SHARE) return;
     if (kept.length > MEDIAN_WINDOW) iv = kept;
     if (iv.length < MEDIAN_WINDOW) return;
     const smooth = runningMedian(iv, MEDIAN_WINDOW);
@@ -233,6 +251,12 @@ export class PulseEngine {
       return;
     }
     this.bpmValue = bpm;
+    // Show a number only once three successive estimates agree within 4 BPM, then glide toward new ones,
+    // so the screen does not flash an early 100 before settling on 78.
+    this.recent = [...(this.recent || []), bpm].slice(-3);
+    const steady = this.recent.length === 3 && Math.max(...this.recent) - Math.min(...this.recent) <= 4;
+    if (this.shown === null && steady) this.shown = bpm;
+    else if (this.shown !== null) this.shown += 0.3 * (bpm - this.shown);
   }
 
   // 0..1 from how regular the accepted intervals are and how many intervals survived the median gate.
@@ -262,7 +286,7 @@ export class PulseEngine {
   }
 
   status(finger) {
-    const bpm = this.bpmValue ? Math.round(this.bpmValue) : null;
+    const bpm = this.shown !== null ? Math.round(this.shown) : null;
     const strength = this.quality();
     return {
       finger,
