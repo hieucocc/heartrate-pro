@@ -7,7 +7,7 @@ import {
   useCameraPermission,
   useFrameProcessor,
 } from 'react-native-vision-camera';
-import { Worklets } from 'react-native-worklets-core';
+import { Worklets, useSharedValue } from 'react-native-worklets-core';
 import * as Haptics from 'expo-haptics';
 import { PulseEngine } from './ppg';
 import { canLockCamera, setCameraLocked } from './cameraLock';
@@ -66,12 +66,13 @@ export default function Measure({ onClose, onDone, haptics, long = false, onLong
     if (locked.current) setCameraLocked(false).catch(() => {});
   }, []);
 
+  const vThreshold = useSharedValue(170);
   const rawLog = useRef([]);
-  const onSample = useCallback((t, r, g, b, clip) => {
-    latest.current = { ...engine.current.push(t, r, g, b), clip };
+  const onSample = useCallback((t, r, g, b, clip, v, thr) => {
+    latest.current = { ...engine.current.push(t, r, g, b, v), clip };
     // Raw frames streamed to Metro in chunks so the pipeline can be tuned offline on real recordings.
     const buf = rawLog.current;
-    buf.push(`${t.toFixed(3)},${r.toFixed(2)},${g.toFixed(2)},${b.toFixed(2)},${clip.toFixed(2)}`);
+    buf.push(`${t.toFixed(3)},${r.toFixed(2)},${g.toFixed(2)},${b.toFixed(2)},${clip.toFixed(2)},${v.toFixed(4)},${thr}`);
     if (buf.length >= 60) {
       console.log(`[RAW] ${buf.join(';')}`);
       rawLog.current = [];
@@ -96,12 +97,17 @@ export default function Measure({ onClose, onDone, haptics, long = false, onLong
       let ag = 0;
       let ab = 0;
       let all = 0;
+      // InPulse's signal: the share of pixels whose HSV value (max channel) is above a threshold that is
+      // nudged by 1 each frame to keep that share within 40-60%, clamped to 100-230.
+      const thr = vThreshold.value;
+      let above = 0;
       for (let y = 0; y < h; y += 6) {
         for (let x = 0; x < w; x += 6) {
           const i = y * stride + x * 4;
           const pb = buf[i];
           const pg = buf[i + 1];
           const pr = buf[i + 2];
+          if (Math.max(pr, pg, pb) > thr) above++;
           ab += pb;
           ag += pg;
           ar += pr;
@@ -116,10 +122,12 @@ export default function Measure({ onClose, onDone, haptics, long = false, onLong
       }
       // Camera presentation time (ms): monotonic and exact per frame, unlike the worklet's Date.now().
       const t = frame.timestamp / 1000;
-      if (n > all * 0.1) onSampleJS(t, r / n, g / n, b / n, 1 - n / all);
-      else if (all > 0) onSampleJS(t, ar / all, ag / all, ab / all, 1 - n / all);
+      if (all === 0) return;
+      const v = above / all;
+      vThreshold.value = Math.min(230, Math.max(100, thr + (v > 0.6 ? 1 : v < 0.4 ? -1 : 0)));
+      onSampleJS(t, ar / all, ag / all, ab / all, 1 - n / all, v, thr);
     },
-    [onSampleJS],
+    [onSampleJS, vThreshold],
   );
 
   useEffect(() => {
