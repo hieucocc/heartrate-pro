@@ -3,85 +3,82 @@ import { Pressable, StyleSheet, Text, View } from 'react-native';
 import {
   Camera,
   useCameraDevice,
+  useCameraFormat,
   useCameraPermission,
   useFrameProcessor,
 } from 'react-native-vision-camera';
 import { Worklets } from 'react-native-worklets-core';
-import { estimateBpm } from './ppg';
+import { PulseEngine } from './ppg';
 
 const MEASURE_SECONDS = 25;
-const WINDOW_SECONDS = 15;
 
 export default function App() {
   const { hasPermission, requestPermission } = useCameraPermission();
   const device = useCameraDevice('back');
+  const format = useCameraFormat(device, [{ videoResolution: { width: 640, height: 480 } }, { fps: 30 }]);
   const [running, setRunning] = useState(false);
   const [bpm, setBpm] = useState(null);
   const [fingerOn, setFingerOn] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [done, setDone] = useState(false);
-  const samples = useRef([]);
-  const startedAt = useRef(0);
-  const lastFingerAt = useRef(0);
+  const [hrv, setHrv] = useState(null);
+  const engine = useRef(new PulseEngine());
+  const latest = useRef(null);
+  const measureStart = useRef(null);
 
   useEffect(() => {
     if (!hasPermission) requestPermission();
   }, [hasPermission, requestPermission]);
 
-  const onSample = useCallback((t, red, green) => {
-    // Finger over the lens with torch on: image is strongly red, little green.
-    const finger = red > 120 && green < red * 0.6;
-    setFingerOn(finger);
-    if (!finger) {
-      samples.current = [];
-      startedAt.current = Date.now();
-      return;
-    }
-    lastFingerAt.current = t;
-    samples.current.push({ t, v: red });
-    const cutoff = t - WINDOW_SECONDS;
-    while (samples.current.length && samples.current[0].t < cutoff) samples.current.shift();
+  // Called from the frame processor thread at camera rate; keep it cheap.
+  const onSample = useCallback((t, r, g, b) => {
+    latest.current = engine.current.push(t, r, g, b);
   }, []);
   const onSampleJS = Worklets.createRunOnJS(onSample);
 
   const frameProcessor = useFrameProcessor(
     (frame) => {
       'worklet';
-      // iOS 'rgb' frames are BGRA, 4 bytes per pixel.
+      // iOS 'rgb' frames are BGRA, 4 bytes per pixel. Average the whole frame on a coarse grid.
       const buf = new Uint8Array(frame.toArrayBuffer());
       const w = frame.width;
       const h = frame.height;
       const stride = frame.bytesPerRow;
-      const x0 = Math.floor(w * 0.3);
-      const x1 = Math.floor(w * 0.7);
-      const y0 = Math.floor(h * 0.3);
-      const y1 = Math.floor(h * 0.7);
       let r = 0;
       let g = 0;
+      let b = 0;
       let n = 0;
-      for (let y = y0; y < y1; y += 6) {
-        for (let x = x0; x < x1; x += 6) {
+      for (let y = 0; y < h; y += 8) {
+        for (let x = 0; x < w; x += 8) {
           const i = y * stride + x * 4;
+          b += buf[i];
           g += buf[i + 1];
           r += buf[i + 2];
           n++;
         }
       }
-      if (n > 0) onSampleJS(Date.now() / 1000, r / n, g / n);
+      if (n > 0) onSampleJS(Date.now() / 1000, r / n, g / n, b / n);
     },
     [onSampleJS],
   );
 
-  // Recompute BPM and progress twice a second while measuring.
+  // Poll the engine twice a second for UI updates.
   useEffect(() => {
     if (!running) return undefined;
-    startedAt.current = Date.now();
+    engine.current.reset();
+    latest.current = null;
+    measureStart.current = null;
     const id = setInterval(() => {
-      const secs = (Date.now() - startedAt.current) / 1000;
+      const s = latest.current;
+      if (!s) return;
+      setFingerOn(s.finger);
+      if (s.state === 0) measureStart.current = null;
+      else if (measureStart.current === null) measureStart.current = Date.now();
+      const secs = measureStart.current ? (Date.now() - measureStart.current) / 1000 : 0;
       setElapsed(secs);
-      const est = estimateBpm(samples.current);
-      if (est) setBpm(est);
-      if (secs >= MEASURE_SECONDS) {
+      if (s.bpm) setBpm(s.bpm);
+      if (secs >= MEASURE_SECONDS && s.bpm) {
+        setHrv(engine.current.hrv());
         setRunning(false);
         setDone(true);
       }
@@ -90,8 +87,8 @@ export default function App() {
   }, [running]);
 
   const start = () => {
-    samples.current = [];
     setBpm(null);
+    setHrv(null);
     setDone(false);
     setElapsed(0);
     setRunning(true);
@@ -120,7 +117,7 @@ export default function App() {
       ? 'Done. Measure again any time.'
       : 'Press Start, then cover the rear camera and flash with your fingertip.'
     : fingerOn
-      ? 'Hold still, light pressure...'
+      ? 'Hold your finger still...'
       : 'Cover the camera AND the flash with your fingertip.';
 
   return (
@@ -128,6 +125,7 @@ export default function App() {
       <Camera
         style={styles.preview}
         device={device}
+        format={format}
         isActive={running}
         torch={running ? 'on' : 'off'}
         pixelFormat="rgb"
@@ -141,6 +139,11 @@ export default function App() {
         <View style={styles.track}>
           <View style={[styles.fill, { width: `${Math.min(100, (elapsed / MEASURE_SECONDS) * 100)}%` }]} />
         </View>
+      )}
+      {done && hrv && (
+        <Text style={styles.hrv}>
+          SDNN {hrv.sdnn} ms · RMSSD {hrv.rmssd} ms · pNN50 {hrv.pnn50}%
+        </Text>
       )}
       <Pressable
         style={[styles.btn, running && styles.btnStop]}
@@ -161,6 +164,7 @@ const styles = StyleSheet.create({
   bpm: { color: '#ff4d5e', fontSize: 96, fontWeight: '700' },
   unit: { color: '#9a9aa5', fontSize: 18, letterSpacing: 4, marginBottom: 24 },
   hint: { color: '#d8d8e0', fontSize: 16, textAlign: 'center', marginBottom: 24, minHeight: 44 },
+  hrv: { color: '#9a9aa5', fontSize: 14, marginBottom: 24 },
   msg: { color: '#d8d8e0', fontSize: 16, marginBottom: 16 },
   track: { width: '80%', height: 6, backgroundColor: '#23232c', borderRadius: 3, marginBottom: 32, overflow: 'hidden' },
   fill: { height: '100%', backgroundColor: '#ff4d5e' },
