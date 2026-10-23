@@ -25,6 +25,7 @@ const TICK_MS = 66;               // UI refresh (~15 fps)
 const WAVE_SAMPLES = 120;         // 4 s of signal on screen
 const EXPOSURE_WINDOW = 3000;     // only tune exposure bias in the first ms after the finger lands
 const LOCK_AFTER_MS = 700;        // auto-exposure settling time before the lock
+const CLIP_TUNE_MS = 3000;        // longest we keep lowering exposure to unclip the frame before locking
 
 // Scale from a robust spread so one outlier does not flatten the drawn wave; eased by the caller.
 function waveSpan(v) {
@@ -107,12 +108,13 @@ export default function Measure({ onClose, onDone, haptics, long = false, onLong
           const pb = buf[i];
           const pg = buf[i + 1];
           const pr = buf[i + 2];
-          if (Math.max(pr, pg, pb) > thr) above++;
           ab += pb;
           ag += pg;
           ar += pr;
           all++;
           if (pr < 250 && pg < 250) {
+            // Torch-saturated pixels sit above any threshold and would pin the share; count unclipped ones only.
+            if (Math.max(pr, pg, pb) > thr) above++;
             b += pb;
             g += pg;
             r += pr;
@@ -123,7 +125,7 @@ export default function Measure({ onClose, onDone, haptics, long = false, onLong
       // Camera presentation time (ms): monotonic and exact per frame, unlike the worklet's Date.now().
       const t = frame.timestamp / 1000;
       if (all === 0) return;
-      const v = above / all;
+      const v = n ? above / n : 0;
       vThreshold.value = Math.min(230, Math.max(100, thr + (v > 0.6 ? 1 : v < 0.4 ? -1 : 0)));
       onSampleJS(t, ar / all, ag / all, ab / all, 1 - n / all, v, thr);
     },
@@ -150,10 +152,20 @@ export default function Measure({ onClose, onDone, haptics, long = false, onLong
       // nudge the exposure bias, only in the first seconds since every step restarts the signal.
       const since = fingerSince.current === null ? null : Date.now() - fingerSince.current;
       if (canLockCamera()) {
-        if (since !== null && since > LOCK_AFTER_MS && !locked.current) {
+        // Like InPulse's target brightness: before locking, step the exposure bias down while the torch
+        // saturates the frame, since clipped pixels cannot carry the pulse.
+        if (since !== null && !locked.current && device && s.clip > 0.1 && since < CLIP_TUNE_MS) {
+          if (ticks.current % 5 === 0) {
+            const step = (device.maxExposure - device.minExposure) / 16;
+            setExpo(Math.max(device.minExposure, expoRef.current - step));
+          }
+        } else if (since !== null && since > LOCK_AFTER_MS && !locked.current) {
           locked.current = true;
           setCameraLocked(true)
-            .then(() => engine.current.exposureChanged())
+            .then(() => {
+              engine.current.exposureChanged();
+              measureStart.current = null;
+            })
             .catch(() => {});
         } else if (since === null && locked.current) {
           locked.current = false;
