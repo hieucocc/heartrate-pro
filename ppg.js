@@ -10,7 +10,7 @@ const MIN_FPS = 10;
 const MAX_GAP = 2;                // seconds between frames before we reset
 const RR_RANGE = [0.3, 1.4];      // seconds (200-43 BPM)
 const RR_TOL = 0.22;              // max relative deviation from the running median
-const RR_WINDOW = 8;              // intervals in the median
+const RR_WINDOW = 12;             // intervals in the median
 const MIN_RR = 3;                 // intervals before a BPM is shown
 const FINGER_FRAMES = 6;          // frames of finger before we start (0.2 s)
 const LOST_FINGER_FRAMES = FS * 0.5;
@@ -102,6 +102,10 @@ class Track {
   addInterval(d) {
     // A gap of about two beats means one weak beat was missed: keep it as one interval instead of losing the run.
     if (d > RR_RANGE[1] && d / 2 >= 0.4 && d / 2 <= RR_RANGE[1]) d /= 2;
+    else if (this.rr.length >= MIN_RR) {
+      const m = median(this.rr.slice(-RR_WINDOW));
+      if (Math.abs(d / 2 - m) / m < RR_TOL) d /= 2;
+    }
     if (d < RR_RANGE[0] || d > RR_RANGE[1]) return;
     this.tried++;
     if (this.rr.length >= MIN_RR) {
@@ -150,7 +154,9 @@ class Track {
     }
     for (const c of scores) if (!best || c.s > best.s) best = c;
     const half = scores.find((c) => Math.abs(c.f - best.f / 2) < 0.03);
-    if (half && half.s > best.s * 0.6) best = half;
+    // Only when the half-rate peak is itself strong: otherwise low-frequency drift halves the rate and the
+    // wider beat window then swallows every other beat.
+    if (half && half.p > best.p * 0.5) best = half;
     this.specHz = best.f;
     this.specShare = total ? best.p / total : 0;
   }
@@ -195,6 +201,7 @@ export class PulseEngine {
     this.nextGrid = null;
     this.warm = 0;
     this.shown = null;
+    this.ch = 0;
   }
 
   // A camera exposure step looks like a huge pulse to the filters: restart the signal and the warm-up.
@@ -206,9 +213,13 @@ export class PulseEngine {
     }
   }
 
+  // Switch channel only on a clear margin, so the number does not hop between red and green estimates.
   get best() {
     const [r, g] = this.tracks;
-    return g.quality() > r.quality() ? g : r;
+    const cur = this.tracks[this.ch || 0];
+    const other = this.tracks[1 - (this.ch || 0)];
+    if (other.quality() > cur.quality() + 0.15) this.ch = other === g ? 1 : 0;
+    return this.tracks[this.ch || 0] || r;
   }
 
   // r, g, b: mean 0..255 over the frame. Returns a status snapshot.
@@ -284,7 +295,7 @@ export class PulseEngine {
     const tr = this.best;
     const raw = tr.bpm();
     // Ease toward the median so the number glides instead of stepping.
-    if (raw) this.shown = this.shown ? this.shown + 0.08 * (raw - this.shown) : raw;
+    if (raw) this.shown = this.shown ? this.shown + 0.04 * (raw - this.shown) : raw;
     const bpm = this.shown ? Math.round(this.shown) : null;
     const strength = tr.quality();
     return {
