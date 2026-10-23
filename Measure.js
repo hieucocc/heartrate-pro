@@ -155,7 +155,8 @@ export default function Measure({ onClose, onDone, haptics }) {
         }
       }
 
-      if (s.state < 2) measureStart.current = null;
+      // Like InPulse, the ring runs from the moment the finger is steady; the number appears once beats are trusted.
+      if (s.state < 1) measureStart.current = null;
       else if (measureStart.current === null) measureStart.current = Date.now();
       const secs = measureStart.current ? (Date.now() - measureStart.current) / 1000 : 0;
       if (ticks.current % 15 === 0) {

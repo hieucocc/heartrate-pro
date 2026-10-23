@@ -89,10 +89,10 @@ class Track {
     const tb = c.t + (den ? (0.5 * (a - b)) / den / FS : 0);
     if (c.y <= 0) return;
     // Gate against the tallest recent peak, so dicrotic bumps cannot drag the threshold down.
-    this.heights = (this.heights || []).filter((h) => tb - h.t < 2.5);
+    this.heights = (this.heights || []).filter((h) => tb - h.t < 1.5);
     const top = Math.max(0, ...this.heights.map((h) => h.y));
     this.heights.push({ t: tb, y: c.y });
-    if (c.y < top * 0.5) return;
+    if (c.y < top * 0.35) return;
     if (this.lastBeat !== null) this.addInterval(tb - this.lastBeat);
     this.lastBeat = tb;
     this.peaks.push(tb);
@@ -100,6 +100,8 @@ class Track {
   }
 
   addInterval(d) {
+    // A gap of about two beats means one weak beat was missed: keep it as one interval instead of losing the run.
+    if (d > RR_RANGE[1] && d / 2 >= 0.4 && d / 2 <= RR_RANGE[1]) d /= 2;
     if (d < RR_RANGE[0] || d > RR_RANGE[1]) return;
     this.tried++;
     if (this.rr.length >= MIN_RR) {
