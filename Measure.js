@@ -12,10 +12,19 @@ import * as Haptics from 'expo-haptics';
 import { PulseEngine } from './ppg';
 import { Heart, Ring, TabIcon, Wave } from './ui';
 
-const MEASURE_SECONDS = 25;
+const MEASURE_SECONDS = 20;
 const GIVE_UP_SECONDS = 60;
 const ACCENT = '#FF4D6A';
 const DARK = { accent: ACCENT, soft: '#2B1A20', text: '#fff' };
+
+// Clip spikes so one outlier does not flatten the drawn wave.
+function displayWave(points) {
+  const v = points.slice(-150).map((p) => p.y);
+  if (v.length < 2) return v;
+  const m = v.reduce((a, b) => a + b, 0) / v.length;
+  const sd = Math.sqrt(v.reduce((a, b) => a + (b - m) ** 2, 0) / v.length) || 1;
+  return v.map((y) => Math.max(m - 3 * sd, Math.min(m + 3 * sd, y)));
+}
 
 export default function Measure({ onClose, onDone, haptics }) {
   const { hasPermission, requestPermission } = useCameraPermission();
@@ -25,7 +34,10 @@ export default function Measure({ onClose, onDone, haptics }) {
   const latest = useRef(null);
   const measureStart = useRef(null);
   const openedAt = useRef(Date.now());
-  const [ui, setUi] = useState({ finger: false, bpm: null, confidence: 0, progress: 0, wave: [] });
+  const ticks = useRef(0);
+  const [ui, setUi] = useState({ finger: false, bpm: null, strength: 0, progress: 0, wave: [], dbg: '' });
+  const [expo, setExpo] = useState(0);
+  const [debug, setDebug] = useState(false);
   const [failed, setFailed] = useState(false);
   const [active, setActive] = useState(true);
 
@@ -74,12 +86,27 @@ export default function Measure({ onClose, onDone, haptics }) {
         return;
       }
       if (!s) return;
+      ticks.current++;
+
+      // Keep the red channel away from clipping: lower exposure when it saturates, raise it when too dark.
+      if (device && ticks.current % 3 === 0 && s.finger && (s.state < 2 || s.rgb[0] > 250)) {
+        const step = (device.maxExposure - device.minExposure) / 24;
+        if (s.rgb[0] > 238) setExpo((e) => Math.max(device.minExposure, e - step));
+        else if (s.rgb[0] < 140) setExpo((e) => Math.min(device.maxExposure, e + step));
+      }
+
       if (s.state === 0) measureStart.current = null;
       else if (measureStart.current === null) measureStart.current = Date.now();
       const secs = measureStart.current ? (Date.now() - measureStart.current) / 1000 : 0;
-      const wave = s.wave.slice(-150).map((p) => p.y);
-      setUi({ finger: s.finger, bpm: s.bpm, confidence: s.confidence, progress: secs / MEASURE_SECONDS, wave });
-      if (secs >= MEASURE_SECONDS && s.bpm) {
+      setUi({
+        finger: s.finger,
+        bpm: s.bpm,
+        strength: s.strength,
+        progress: secs / MEASURE_SECONDS,
+        wave: displayWave(s.wave),
+        dbg: `R${Math.round(s.rgb[0])} G${Math.round(s.rgb[1])} B${Math.round(s.rgb[2])}  ${s.fps.toFixed(0)}fps  st${s.state}  beats ${s.beats}  q${s.strength.toFixed(2)}`,
+      });
+      if (secs >= MEASURE_SECONDS && s.bpm && s.strength >= 0.3) {
         setActive(false);
         if (haptics) Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
         const step = Math.max(1, Math.floor(s.wave.length / 60));
@@ -93,7 +120,7 @@ export default function Measure({ onClose, onDone, haptics }) {
       }
     }, 400);
     return () => clearInterval(id);
-  }, [active, haptics, onDone]);
+  }, [active, haptics, onDone, device]);
 
   const retry = () => {
     engine.current.reset();
@@ -101,11 +128,17 @@ export default function Measure({ onClose, onDone, haptics }) {
     measureStart.current = null;
     openedAt.current = Date.now();
     setFailed(false);
-    setUi({ finger: false, bpm: null, confidence: 0, progress: 0, wave: [] });
+    setUi({ finger: false, bpm: null, strength: 0, progress: 0, wave: [], dbg: '' });
     setActive(true);
   };
 
-  const quality = !ui.finger ? null : ui.confidence >= 70 ? { label: 'Signal Good', color: '#34D27A' } : { label: 'Weak Signal', color: '#FFAA33' };
+  const quality = !ui.finger
+    ? null
+    : !ui.bpm
+      ? { label: 'Reading signal...', color: '#B5B5BF' }
+      : ui.strength >= 0.5
+        ? { label: 'Signal Good', color: '#34D27A' }
+        : { label: 'Weak Signal', color: '#FFAA33' };
   const title = failed
     ? "Couldn't get a clear reading"
     : ui.finger
@@ -121,6 +154,7 @@ export default function Measure({ onClose, onDone, haptics }) {
           format={format}
           isActive={active}
           torch={active ? 'on' : 'off'}
+          exposure={expo}
           pixelFormat="rgb"
           fps={30}
           frameProcessor={frameProcessor}
@@ -130,7 +164,10 @@ export default function Measure({ onClose, onDone, haptics }) {
         <TabIcon name="close" color="#fff" size={26} />
       </Pressable>
 
-      <Text style={styles.title}>{hasPermission ? title : 'Camera access is required'}</Text>
+      <Pressable onPress={() => setDebug((d) => !d)}>
+        <Text style={styles.title}>{hasPermission ? title : 'Camera access is required'}</Text>
+      </Pressable>
+      {debug && <Text style={styles.dbg}>{ui.dbg} exp{expo.toFixed(1)}</Text>}
 
       <View style={styles.ringBox}>
         <Ring size={250} stroke={7} progress={ui.progress} color={ACCENT} track="#2A2A31" />
@@ -169,9 +206,10 @@ export default function Measure({ onClose, onDone, haptics }) {
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#07070A', alignItems: 'center', paddingTop: 64 },
   camera: { position: 'absolute', top: 0, left: 0, width: 16, height: 16, opacity: 0.02 },
-  close: { position: 'absolute', top: 58, left: 20 },
+  close: { position: 'absolute', top: 58, left: 20, zIndex: 2 },
   title: { color: '#fff', fontSize: 19, textAlign: 'center', lineHeight: 26, marginTop: 8, minHeight: 56 },
-  ringBox: { width: 250, height: 250, marginTop: 36, alignItems: 'center', justifyContent: 'center' },
+  dbg: { color: '#7a7a85', fontSize: 11, marginTop: 2 },
+  ringBox: { width: 250, height: 250, marginTop: 30, alignItems: 'center', justifyContent: 'center' },
   ringInner: { position: 'absolute', alignItems: 'center' },
   bpm: { color: '#fff', fontSize: 52, fontWeight: '700', marginTop: 6 },
   unit: { color: '#B5B5BF', fontSize: 14, marginTop: -2 },

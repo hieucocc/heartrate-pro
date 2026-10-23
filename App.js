@@ -83,9 +83,9 @@ export default function App() {
         {measuring && <Measure haptics={state.settings.haptics} onClose={() => setMeasuring(false)} onDone={onDone} />}
       </Modal>
 
-      <Modal visible={!!result} animationType="slide" presentationStyle="fullScreen" onRequestClose={() => setResult(null)}>
-        {result && (
-          <View style={{ flex: 1, backgroundColor: t.bg }}>
+      {/* Rendered in-tree, not as a second Modal: iOS drops a modal presented while another is dismissing. */}
+      {result && (
+        <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: t.bg }}>
             <Result
               t={t}
               result={result.reading}
@@ -106,9 +106,8 @@ export default function App() {
                 setResult(null);
               }}
             />
-          </View>
-        )}
-      </Modal>
+        </View>
+      )}
     </View>
   );
 }
