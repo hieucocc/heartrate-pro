@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "HeartratePro",
+    "slug": "heartrate-pro",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "bundleIdentifier": "com.heartratepro.app",
+      "supportsTablet": false,
+      "infoPlist": {
+        "NSCameraUsageDescription": "Camera is used to detect your pulse through your fingertip."
+      }
+    },
+    "plugins": [
+      [
+        "react-native-vision-camera",
+        {
+          "cameraPermissionText": "Camera is used to detect your pulse through your fingertip."
+        }
+      ],
+      "expo-asset"
+    ]
+  }
+}
