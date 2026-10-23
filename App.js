@@ -81,7 +81,7 @@ export default function App() {
       </View>
 
       <Modal visible={measuring} animationType="slide" presentationStyle="fullScreen" onRequestClose={() => setMeasuring(false)}>
-        {measuring && <Measure haptics={state.settings.haptics} onClose={() => setMeasuring(false)} onDone={onDone} />}
+        {measuring && <Measure haptics={state.settings.haptics} long={state.settings.longMeasure} onLongChange={(longMeasure) => update((s) => ({ ...s, settings: { ...s.settings, longMeasure } }))} onClose={() => setMeasuring(false)} onDone={onDone} />}
       </Modal>
 
       {/* Rendered in-tree, not as a second Modal: iOS drops a modal presented while another is dismissing. */}

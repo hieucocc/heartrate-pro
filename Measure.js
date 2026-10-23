@@ -13,8 +13,11 @@ import { PulseEngine } from './ppg';
 import { canLockCamera, setCameraLocked } from './cameraLock';
 import { Heart, Ring, TabIcon, Wave } from './ui';
 
-const MEASURE_SECONDS = 20;
-const GIVE_UP_SECONDS = 60;
+const MODES = [
+  { long: false, label: 'Quick', secs: 20 },
+  { long: true, label: '1 min', secs: 60 },
+];
+const GIVE_UP_SECONDS = 60;       // without any BPM
 const ACCENT = '#FF4D6A';
 const DARK = { accent: ACCENT, soft: '#2B1A20', text: '#fff' };
 
@@ -31,7 +34,10 @@ function waveSpan(v) {
   return sd ? [m - 2.5 * sd, m + 2.5 * sd] : null;
 }
 
-export default function Measure({ onClose, onDone, haptics }) {
+export default function Measure({ onClose, onDone, haptics, long = false, onLongChange }) {
+  const measureSeconds = MODES.find((m) => m.long === long).secs;
+  const secsRef = useRef(measureSeconds);
+  secsRef.current = measureSeconds;
   const { hasPermission, requestPermission } = useCameraPermission();
   // The plain wide-angle lens sits next to the torch, and it is the device the exposure lock targets.
   const device = useCameraDevice('back', { physicalDevices: ['wide-angle-camera'] });
@@ -176,12 +182,12 @@ export default function Measure({ onClose, onDone, haptics }) {
         finger: s.finger,
         bpm: s.bpm,
         strength: s.strength,
-        progress: secs / MEASURE_SECONDS,
+        progress: secs / secsRef.current,
         wave,
         domain: domain.current,
         dbg: `R${Math.round(s.rgb[0])} G${Math.round(s.rgb[1])} B${Math.round(s.rgb[2])}  ${s.fps.toFixed(0)}fps  st${s.state}  ${s.channel}  beats ${s.beats}  q${s.strength.toFixed(2)}`,
       });
-      if (secs >= MEASURE_SECONDS && s.bpm && s.strength >= 0.3) {
+      if (secs >= secsRef.current && s.bpm && s.strength >= 0.3) {
         setActive(false);
         if (haptics) Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
         const step = Math.max(1, Math.floor(s.wave.length / 60));
@@ -261,6 +267,18 @@ export default function Measure({ onClose, onDone, haptics }) {
         </View>
       </View>
 
+      <View style={styles.modes}>
+        {MODES.map((m) => (
+          <Pressable
+            key={m.label}
+            onPress={() => onLongChange?.(m.long)}
+            style={[styles.mode, m.long === long && styles.modeOn]}
+          >
+            <Text style={[styles.modeText, m.long === long && styles.modeTextOn]}>{m.label}</Text>
+          </Pressable>
+        ))}
+      </View>
+
       <Wave values={ui.wave} domain={ui.domain} width={300} height={56} color={ACCENT} />
 
       <View style={styles.quality}>
@@ -296,6 +314,11 @@ const styles = StyleSheet.create({
   ringInner: { position: 'absolute', alignItems: 'center' },
   bpm: { color: '#fff', fontSize: 52, fontWeight: '700', marginTop: 6 },
   unit: { color: '#B5B5BF', fontSize: 14, marginTop: -2 },
+  modes: { flexDirection: 'row', backgroundColor: '#1A1A20', borderRadius: 18, padding: 3, marginTop: 18, marginBottom: 14 },
+  mode: { paddingVertical: 7, paddingHorizontal: 18, borderRadius: 15 },
+  modeOn: { backgroundColor: '#2B1A20' },
+  modeText: { color: '#8A8A94', fontSize: 13, fontWeight: '600' },
+  modeTextOn: { color: ACCENT },
   quality: { flexDirection: 'row', alignItems: 'center', gap: 6, height: 24, marginTop: 20 },
   qText: { fontSize: 13 },
   pill: {
