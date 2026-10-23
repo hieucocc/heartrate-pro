@@ -4,11 +4,12 @@
     "slug": "heartrate-pro",
     "version": "1.0.0",
     "orientation": "portrait",
-    "userInterfaceStyle": "dark",
+    "userInterfaceStyle": "automatic",
     "ios": {
       "bundleIdentifier": "com.heartratepro.app",
       "supportsTablet": false,
       "infoPlist": {
+        "CFBundleDisplayName": "Pulse",
         "NSCameraUsageDescription": "Camera is used to detect your pulse through your fingertip."
       }
     },
