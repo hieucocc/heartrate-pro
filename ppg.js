@@ -107,6 +107,13 @@ class Track {
       if (Math.abs(d / 2 - m) / m < RR_TOL) d /= 2;
     }
     if (d < RR_RANGE[0] || d > RR_RANGE[1]) return;
+    // The spectral rate is a sanity anchor while the interval run is young: early missed beats otherwise
+    // seed the median with double-length intervals and the reading sits near half the true rate.
+    if (this.specHz && this.rr.length < RR_WINDOW) {
+      const p = 1 / this.specHz;
+      if (Math.abs(d / 2 - p) / p < RR_TOL) d /= 2;
+      if (Math.abs(d - p) / p > 0.3) return;
+    }
     this.tried++;
     if (this.rr.length >= MIN_RR) {
       const m = median(this.rr.slice(-RR_WINDOW));
@@ -295,7 +302,8 @@ export class PulseEngine {
     const tr = this.best;
     const raw = tr.bpm();
     // Ease toward the median so the number glides instead of stepping.
-    if (raw) this.shown = this.shown ? this.shown + 0.04 * (raw - this.shown) : raw;
+    // Jump on a large disagreement (the estimate was corrected), glide on small ones.
+    if (raw) this.shown = this.shown && Math.abs(raw - this.shown) < 6 ? this.shown + 0.06 * (raw - this.shown) : raw;
     const bpm = this.shown ? Math.round(this.shown) : null;
     const strength = tr.quality();
     return {
