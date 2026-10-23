@@ -10,7 +10,6 @@ import {
 import { Worklets, useSharedValue } from 'react-native-worklets-core';
 import * as Haptics from 'expo-haptics';
 import { PulseEngine } from './ppg';
-import { canLockCamera, setCameraLocked } from './cameraLock';
 import { Heart, Ring, TabIcon, Wave } from './ui';
 
 const MODES = [
@@ -23,9 +22,6 @@ const DARK = { accent: ACCENT, soft: '#2B1A20', text: '#fff' };
 
 const TICK_MS = 66;               // UI refresh (~15 fps)
 const WAVE_SAMPLES = 120;         // 4 s of signal on screen
-const EXPOSURE_WINDOW = 3000;     // only tune exposure bias in the first ms after the finger lands
-const LOCK_AFTER_MS = 700;        // auto-exposure settling time before the lock
-const CLIP_TUNE_MS = 3000;        // longest we keep lowering exposure to unclip the frame before locking
 
 // Scale from a robust spread so one outlier does not flatten the drawn wave; eased by the caller.
 function waveSpan(v) {
@@ -42,19 +38,15 @@ export default function Measure({ onClose, onDone, haptics, long = false, onLong
   const { hasPermission, requestPermission } = useCameraPermission();
   // The plain wide-angle lens sits next to the torch, and it is the device the exposure lock targets.
   const device = useCameraDevice('back', { physicalDevices: ['wide-angle-camera'] });
-  const locked = useRef(false);
-  const format = useCameraFormat(device, [{ videoResolution: { width: 640, height: 480 } }, { fps: 30 }]);
+  // Like InPulse (AVCaptureSessionPresetLow): the smallest format at 30 fps; a finger fills any frame.
+  const format = useCameraFormat(device, [{ fps: 30 }, { videoResolution: { width: 192, height: 144 } }]);
   const engine = useRef(new PulseEngine());
   const latest = useRef(null);
   const measureStart = useRef(null);
   const openedAt = useRef(Date.now());
   const ticks = useRef(0);
-  const fingerSince = useRef(null);
   const domain = useRef(null);
   const [ui, setUi] = useState({ finger: false, bpm: null, strength: 0, progress: 0, wave: [], domain: null, dbg: '' });
-  const [expo, setExpo] = useState(0);
-  const expoRef = useRef(0);
-  expoRef.current = expo;
   const [debug, setDebug] = useState(false);
   const [failed, setFailed] = useState(false);
   const [active, setActive] = useState(true);
@@ -62,10 +54,6 @@ export default function Measure({ onClose, onDone, haptics, long = false, onLong
   useEffect(() => {
     if (!hasPermission) requestPermission();
   }, [hasPermission, requestPermission]);
-
-  useEffect(() => () => {
-    if (locked.current) setCameraLocked(false).catch(() => {});
-  }, []);
 
   const vThreshold = useSharedValue(170);
   const rawLog = useRef([]);
@@ -102,8 +90,8 @@ export default function Measure({ onClose, onDone, haptics, long = false, onLong
       // nudged by 1 each frame to keep that share within 40-60%, clamped to 100-230.
       const thr = vThreshold.value;
       let above = 0;
-      for (let y = 0; y < h; y += 6) {
-        for (let x = 0; x < w; x += 6) {
+      for (let y = 0; y < h; y += 2) {
+        for (let x = 0; x < w; x += 2) {
           const i = y * stride + x * 4;
           const pb = buf[i];
           const pg = buf[i + 1];
@@ -144,42 +132,9 @@ export default function Measure({ onClose, onDone, haptics, long = false, onLong
       if (!s) return;
       ticks.current++;
 
-      if (!s.finger) fingerSince.current = null;
-      else if (fingerSince.current === null) fingerSince.current = Date.now();
 
-      // Like InPulse: let auto-exposure settle on the lit finger, then lock it, because a live auto-exposure
-      // brightens and darkens the frame against every heartbeat. Builds without the lock module instead
-      // nudge the exposure bias, only in the first seconds since every step restarts the signal.
-      const since = fingerSince.current === null ? null : Date.now() - fingerSince.current;
-      if (canLockCamera()) {
-        // Like InPulse's target brightness: before locking, step the exposure bias down while the torch
-        // saturates the frame, since clipped pixels cannot carry the pulse.
-        if (since !== null && !locked.current && device && s.clip > 0.1 && since < CLIP_TUNE_MS) {
-          if (ticks.current % 5 === 0) {
-            const step = (device.maxExposure - device.minExposure) / 16;
-            setExpo(Math.max(device.minExposure, expoRef.current - step));
-          }
-        } else if (since !== null && since > LOCK_AFTER_MS && !locked.current) {
-          locked.current = true;
-          setCameraLocked(true)
-            .then(() => {
-              engine.current.exposureChanged();
-              measureStart.current = null;
-            })
-            .catch(() => {});
-        } else if (since === null && locked.current) {
-          locked.current = false;
-          setCameraLocked(false).catch(() => {});
-        }
-      } else if (device && since !== null && since < EXPOSURE_WINDOW && ticks.current % 5 === 0) {
-        const step = (device.maxExposure - device.minExposure) / 16;
-        const e = expoRef.current;
-        const next = s.clip > 0.3 ? Math.max(device.minExposure, e - step) : s.rgb[0] < 110 ? Math.min(device.maxExposure, e + step) : e;
-        if (next !== e) {
-          setExpo(next);
-          engine.current.exposureChanged();
-        }
-      }
+      // InPulse leaves the camera on continuous auto-exposure with the torch at full power; locking or
+      // stepping the exposure ourselves gave far weaker pulses on real recordings, so we do not touch it.
 
       // Like InPulse, the ring runs from the moment the finger is steady; the number appears once beats are trusted.
       if (s.state < 1) measureStart.current = null;
@@ -189,7 +144,7 @@ export default function Measure({ onClose, onDone, haptics, long = false, onLong
         // Streams to the Metro terminal when running the dev client.
         console.log(
           `[PPG] finger=${s.finger} st=${s.state} R=${s.rgb[0].toFixed(0)} G=${s.rgb[1].toFixed(0)} B=${s.rgb[2].toFixed(0)} ` +
-            `fps=${s.fps.toFixed(1)} ch=${s.channel} beats=${s.beats} bpm=${s.bpm} q=${s.strength.toFixed(2)} expo=${expoRef.current.toFixed(1)}`,
+            `fps=${s.fps.toFixed(1)} ch=${s.channel} beats=${s.beats} bpm=${s.bpm} q=${s.strength.toFixed(2)}`,
         );
       }
       const wave = s.wave.slice(-WAVE_SAMPLES).map((p) => p.y);
@@ -228,7 +183,6 @@ export default function Measure({ onClose, onDone, haptics, long = false, onLong
     engine.current.reset();
     latest.current = null;
     measureStart.current = null;
-    fingerSince.current = null;
     domain.current = null;
     openedAt.current = Date.now();
     setFailed(false);
@@ -260,7 +214,6 @@ export default function Measure({ onClose, onDone, haptics, long = false, onLong
           format={format}
           isActive={active}
           torch={active ? 'on' : 'off'}
-          exposure={expo}
           pixelFormat="rgb"
           // Any frame-to-frame image processing smears or cancels the tiny pulse brightness change.
           videoStabilizationMode="off"
@@ -277,7 +230,7 @@ export default function Measure({ onClose, onDone, haptics, long = false, onLong
       <Pressable onPress={() => setDebug((d) => !d)}>
         <Text style={styles.title}>{hasPermission ? title : 'Camera access is required'}</Text>
       </Pressable>
-      {debug && <Text style={styles.dbg}>{ui.dbg} exp{expo.toFixed(1)}</Text>}
+      {debug && <Text style={styles.dbg}>{ui.dbg}</Text>}
 
       <View style={styles.ringBox}>
         <Ring size={250} stroke={7} progress={ui.progress} color={ACCENT} track="#2A2A31" duration={TICK_MS} />
