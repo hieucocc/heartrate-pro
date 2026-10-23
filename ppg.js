@@ -4,8 +4,9 @@
 //   filter  = uniform resample at FS, order-6 Butterworth band-pass 0.4-3.6 Hz
 //   beats   = smoothed z-score (lag 4 s, threshold 0.1, influence 0.5); each run of "above" samples
 //             longer than 5 samples is one beat, placed at its highest sample
-//   BPM     = beat-to-beat intervals since the start; keep those within +-0.2 s of their median,
-//             running median (window 5), then 60 / median. Outside 40-240 BPM the session restarts.
+//   BPM     = our change: autocorrelation of the last 8 s of the filtered signal, median of recent
+//             estimates. InPulse instead takes 60 / median of median-gated beat intervals, which on
+//             our weaker camera signal misses beats; its beat list is kept for HRV.
 
 const FS = 30;
 const BAND = [0.4, 3.6];
@@ -20,13 +21,12 @@ const LAG = FS * 4;             // z-score window
 const Z_THRESHOLD = 0.1;
 const Z_INFLUENCE = 0.5;
 const MIN_RUN = 5;              // samples above before a run counts as a beat
-const MIN_BEATS = 6;            // beats before a BPM is reported
 const RR_BAND = 0.2;            // s around the median interval
-const MEDIAN_WINDOW = 5;
 const BPM_RANGE = [40, 240];
 const REFRACTORY = 60 / 180;    // s; closer beats are merged (our addition)
-const MIN_KEPT = 6;             // agreeing intervals before a BPM is shown (our addition)
-const KEPT_SHARE = 0.5;
+const AC_SECONDS = 8;           // autocorrelation window (our addition)
+const AC_MIN = 0.15;            // weaker periodicity is not reported
+const HISTORY = 10;             // estimates in the reported median
 
 function biquad(type, f, q) {
   const w = (2 * Math.PI * f) / FS;
@@ -55,12 +55,6 @@ const std = (a) => {
   const m = mean(a);
   return Math.sqrt(mean(a.map((x) => (x - m) ** 2)));
 };
-
-// Running median over `w` samples; the first w-1 outputs repeat the first full window, as InPulse does.
-function runningMedian(a, w) {
-  const out = a.map((_, i) => (i >= w - 1 ? median(a.slice(i - w + 1, i + 1)) : null));
-  return out.map((v) => (v === null ? out[w - 1] : v));
-}
 
 // Camera exposure varies, so judge "finger" by colour ratios rather than InPulse's fixed R>170, G/B<100:
 // with our exposure lock a covered lens often reads R 120-160.
@@ -97,6 +91,9 @@ export class PulseEngine {
     this.rr = [];
     this.bpmValue = null;
     this.recent = [];
+    this.history = [];
+    this.acStrength = 0;
+    this.sinceEstimate = 0;
     this.shown = null;
     this.kept = 0;
   }
@@ -156,7 +153,7 @@ export class PulseEngine {
     return this.status(true);
   }
 
-  // Linear resample to the FS grid, filter, then beat detection. Returns true when a beat was added.
+  // Linear resample to the FS grid, filter, then beat detection. Returns true when a new estimate is due.
   feed(t, v) {
     if (!this.prev) {
       // Settle the filters on the first level so there is no start-up transient.
@@ -173,6 +170,10 @@ export class PulseEngine {
       this.raw.push({ t: tg, y });
       if (this.raw.length > FS * 12) this.raw.shift();
       if (this.detect(y, tg)) beat = true;
+      if (++this.sinceEstimate >= FS / 2) {
+        this.sinceEstimate = 0;
+        beat = true;
+      }
       this.nextGrid += 1 / FS;
     }
     this.prev = { t, v };
@@ -233,41 +234,61 @@ export class PulseEngine {
     return true;
   }
 
-  estimate() {
-    if (this.peaks.length <= MIN_BEATS) return;
-    let iv = this.rr;
-    const m = median(iv);
-    const kept = iv.filter((d) => d > m - RR_BAND && d < m + RR_BAND);
-    this.kept = kept.length;
-    // Report only once most intervals agree; InPulse shows its first number with fewer, but on our weaker
-    // signal that first number is the one that jumps around.
-    if (kept.length < MIN_KEPT || kept.length < iv.length * KEPT_SHARE) return;
-    if (kept.length > MEDIAN_WINDOW) iv = kept;
-    if (iv.length < MEDIAN_WINDOW) return;
-    const smooth = runningMedian(iv, MEDIAN_WINDOW);
-    const bpm = 60 / (smooth.length > 2 ? median(smooth) : m);
-    if (bpm < BPM_RANGE[0] || bpm > BPM_RANGE[1]) {
-      this.reset();
-      return;
+  // Dominant pulse period of the last 8 s of filtered signal by normalised autocorrelation. InPulse
+  // counts single beats here instead, but on our weaker camera signal that misses beats while the
+  // waveform's periodicity stays clear. A peak at half the lag that is nearly as strong wins, so a run of
+  // alternating beat shapes cannot halve the rate.
+  autocorr() {
+    const x = this.raw.slice(-FS * AC_SECONDS).map((p) => p.y);
+    if (x.length < FS * 5) return null;
+    // Remove the slow wander (breathing, threshold steps) the 0.4 Hz band edge lets through: it otherwise
+    // dominates the autocorrelation at 1.5 s lags. Subtract a 1 s moving mean, then smooth over 5 samples.
+    const hw = FS / 2;
+    const hp = x.map((v, i) => v - mean(x.slice(Math.max(0, i - hw), i + hw + 1)));
+    const d = hp.map((_, i) => mean(hp.slice(Math.max(0, i - 2), i + 3)));
+    const e = d.reduce((a, v) => a + v * v, 0) || 1;
+    const r = [];
+    for (let lag = 0; lag <= FS * 1.6; lag++) {
+      let a = 0;
+      for (let i = 0; i + lag < d.length; i++) a += d[i] * d[i + lag];
+      r.push(a / e);
     }
-    this.bpmValue = bpm;
-    // Show a number only once three successive estimates agree within 4 BPM, then glide toward new ones,
-    // so the screen does not flash an early 100 before settling on 78.
-    this.recent = [...(this.recent || []), bpm].slice(-3);
-    const steady = this.recent.length === 3 && Math.max(...this.recent) - Math.min(...this.recent) <= 4;
-    if (this.shown === null && steady) this.shown = bpm;
-    else if (this.shown !== null) this.shown += 0.3 * (bpm - this.shown);
+    const lo = Math.round(FS * 0.3);
+    let best = null;
+    for (let lag = lo; lag < r.length - 1; lag++) {
+      if (r[lag] > r[lag - 1] && r[lag] >= r[lag + 1] && (!best || r[lag] > r[best])) best = lag;
+    }
+    if (best === null) return null;
+    const half = Math.round(best / 2);
+    for (const h of [half - 1, half, half + 1]) {
+      if (h > lo && h < r.length - 1 && r[h] > r[h - 1] && r[h] >= r[h + 1] && r[h] > 0.6 * r[best]) best = h;
+    }
+    // Parabolic interpolation between lags for sub-sample precision.
+    const den = r[best - 1] - 2 * r[best] + r[best + 1];
+    const lag = best + (den ? (0.5 * (r[best - 1] - r[best + 1])) / den : 0);
+    return { period: lag / FS, strength: r[best] };
   }
 
-  // 0..1 from how regular the accepted intervals are and how many intervals survived the median gate.
+  estimate() {
+    const ac = this.autocorr();
+    if (!ac || ac.strength < AC_MIN) return;
+    const bpm = 60 / ac.period;
+    if (bpm < BPM_RANGE[0] || bpm > BPM_RANGE[1]) return;
+    this.history = [...this.history, bpm].slice(-HISTORY);
+    this.acStrength = ac.strength;
+    this.bpmValue = median(this.history);
+    // Show a number only once three successive estimates agree within 4 BPM, then glide toward new ones,
+    // so the screen does not flash an early 100 before settling on 78.
+    this.recent = [...this.recent, bpm].slice(-3);
+    const steady = this.recent.length === 3 && Math.max(...this.recent) - Math.min(...this.recent) <= 4;
+    if (this.shown === null && steady) this.shown = this.bpmValue;
+    else if (this.shown !== null) this.shown += 0.3 * (this.bpmValue - this.shown);
+  }
+
+  // 0..1 from how strongly the waveform repeats at the reported period.
   quality() {
-    if (!this.bpmValue || this.rr.length < MEDIAN_WINDOW) return 0;
-    const m = median(this.rr);
-    const iv = this.rr.filter((d) => Math.abs(d - m) < RR_BAND);
-    if (iv.length < 3) return 0;
-    const cv = std(iv) / mean(iv);
-    const regular = Math.max(0, 1 - cv * 6);
-    return Math.max(0, Math.min(1, regular * (0.4 + 0.6 * (iv.length / this.rr.length))));
+    if (!this.bpmValue) return 0;
+    return Math.max(0, Math.min(1, (this.acStrength - AC_MIN) / (0.6 - AC_MIN)));
   }
 
   // Time-domain HRV from the accepted beat-to-beat intervals (ms).
