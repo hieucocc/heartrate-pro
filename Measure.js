@@ -37,6 +37,8 @@ export default function Measure({ onClose, onDone, haptics }) {
   const ticks = useRef(0);
   const [ui, setUi] = useState({ finger: false, bpm: null, strength: 0, progress: 0, wave: [], dbg: '' });
   const [expo, setExpo] = useState(0);
+  const expoRef = useRef(0);
+  expoRef.current = expo;
   const [debug, setDebug] = useState(false);
   const [failed, setFailed] = useState(false);
   const [active, setActive] = useState(true);
@@ -98,6 +100,13 @@ export default function Measure({ onClose, onDone, haptics }) {
       if (s.state === 0) measureStart.current = null;
       else if (measureStart.current === null) measureStart.current = Date.now();
       const secs = measureStart.current ? (Date.now() - measureStart.current) / 1000 : 0;
+      if (ticks.current % 3 === 0) {
+        // Streams to the Metro terminal when running the dev client.
+        console.log(
+          `[PPG] finger=${s.finger} st=${s.state} R=${s.rgb[0].toFixed(0)} G=${s.rgb[1].toFixed(0)} B=${s.rgb[2].toFixed(0)} ` +
+            `fps=${s.fps.toFixed(1)} beats=${s.beats} bpm=${s.bpm} q=${s.strength.toFixed(2)} expo=${expoRef.current.toFixed(1)}`,
+        );
+      }
       setUi({
         finger: s.finger,
         bpm: s.bpm,
