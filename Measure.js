@@ -11,6 +11,10 @@ import { Worklets, useSharedValue } from 'react-native-worklets-core';
 import * as Haptics from 'expo-haptics';
 import { PulseEngine } from './ppg';
 import { canLockCamera, setCameraLocked } from './cameraLock';
+import { hasPulseCamera, startPulseCamera } from './pulseCamera';
+
+// Builds with the native InPulse-style capture use it; older ones fall back to vision-camera below.
+const NATIVE = hasPulseCamera();
 import { Heart, Ring, TabIcon, Wave } from './ui';
 
 const MODES = [
@@ -80,6 +84,11 @@ export default function Measure({ onClose, onDone, haptics, long = false, onLong
     }
   }, []);
   const onSampleJS = Worklets.createRunOnJS(onSample);
+
+  useEffect(() => {
+    if (!NATIVE || !active || !hasPermission) return undefined;
+    return startPulseCamera(30, (e) => onSample(e.t, e.r, e.g, e.b, e.clip, e.v, e.thr));
+  }, [active, hasPermission, onSample]);
 
   const frameProcessor = useFrameProcessor(
     (frame) => {
@@ -151,7 +160,9 @@ export default function Measure({ onClose, onDone, haptics, long = false, onLong
       // brightens and darkens the frame against every heartbeat. Builds without the lock module instead
       // nudge the exposure bias, only in the first seconds since every step restarts the signal.
       const since = fingerSince.current === null ? null : Date.now() - fingerSince.current;
-      if (canLockCamera()) {
+      if (NATIVE) {
+        // InPulse keeps continuous auto-exposure; the native capture never locks.
+      } else if (canLockCamera()) {
         // Like InPulse's target brightness: before locking, step the exposure bias down while the torch
         // saturates the frame, since clipped pixels cannot carry the pulse.
         if (since !== null && !locked.current && device && s.clip > 0.1 && since < CLIP_TUNE_MS) {
@@ -253,7 +264,7 @@ export default function Measure({ onClose, onDone, haptics, long = false, onLong
 
   return (
     <View style={styles.root}>
-      {hasPermission && device && (
+      {!NATIVE && hasPermission && device && (
         <Camera
           style={styles.camera}
           device={device}
