@@ -225,7 +225,12 @@ export class PulseEngine {
     const [r, g] = this.tracks;
     const cur = this.tracks[this.ch || 0];
     const other = this.tracks[1 - (this.ch || 0)];
-    if (other.quality() > cur.quality() + 0.15) this.ch = other === g ? 1 : 0;
+    const a = cur.bpm();
+    const b = other.bpm();
+    // A channel skipping every other beat is very regular, so quality alone picks it: at about a 2:1 rate
+    // ratio the faster channel is the one seeing every beat.
+    if (a && b && b / a > 1.6 && b / a < 2.4) this.ch = other === g ? 1 : 0;
+    else if (!(a && b && a / b > 1.6 && a / b < 2.4) && other.quality() > cur.quality() + 0.15) this.ch = other === g ? 1 : 0;
     return this.tracks[this.ch || 0] || r;
   }
 
