@@ -187,7 +187,8 @@ export default function Measure({ onClose, onDone, haptics, long = false, onLong
         domain: domain.current,
         dbg: `R${Math.round(s.rgb[0])} G${Math.round(s.rgb[1])} B${Math.round(s.rgb[2])}  ${s.fps.toFixed(0)}fps  st${s.state}  ${s.channel}  beats ${s.beats}  q${s.strength.toFixed(2)}`,
       });
-      if (secs >= secsRef.current && s.bpm && s.strength >= 0.3) {
+      // Finish when the ring completes; a weak reading still ends here and shows its lower confidence.
+      if (secs >= secsRef.current && s.bpm) {
         setActive(false);
         if (haptics) Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
         const step = Math.max(1, Math.floor(s.wave.length / 60));
